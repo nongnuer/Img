@@ -25,6 +25,7 @@ local MobManager = require(
 -- เก็บ Mob แยกตาม Chunk
 local ChunkMobs = {}
 
+
 --------------------------------------------------
 -- Config ทั่วไป
 --------------------------------------------------
@@ -628,9 +629,122 @@ local ChunkQueue = {}
 local QueueHead = 1
 local QueueTail = 0
 
+--------------------------------------------------
+-- Terrain Network
+--------------------------------------------------
+
+local TerrainRemotes = ReplicatedStorage:FindFirstChild("TerrainRemotes")
+
+if not TerrainRemotes then
+	TerrainRemotes = Instance.new("Folder")
+	TerrainRemotes.Name = "TerrainRemotes"
+	TerrainRemotes.Parent = ReplicatedStorage
+end
+
+local function GetOrCreateRemote(name)
+	local remote = TerrainRemotes:FindFirstChild(name)
+
+	if not remote then
+		remote = Instance.new("RemoteEvent")
+		remote.Name = name
+		remote.Parent = TerrainRemotes
+	end
+
+	return remote
+end
+
+local RequestChunk = GetOrCreateRemote("RequestChunk")
+local ChunkData = GetOrCreateRemote("ChunkData")
+
+-- เก็บข้อมูล Terrain ที่ Server คำนวณแล้ว
+local TerrainPayloadCache = {}
+
+-- ป้องกัน Request ถี่เกินไป
+local LastTerrainRequest = {}
+local TERRAIN_REQUEST_INTERVAL = 0.25
+
+--------------------------------------------------
+-- ส่งข้อมูลให้ผู้เล่นที่อยู่ใกล้ Chunk
+--------------------------------------------------
+
+local function SendChunkToNearbyPlayers(chunkX, chunkZ, payload)
+
+	for _, player in ipairs(Players:GetPlayers()) do
+
+		local character = player.Character
+		local root = character
+			and character:FindFirstChild("HumanoidRootPart")
+
+		if not root then
+			continue
+		end
+
+		local playerChunkX = math.floor(root.Position.X / CHUNK_SIZE)
+		local playerChunkZ = math.floor(root.Position.Z / CHUNK_SIZE)
+
+		local dx = playerChunkX - chunkX
+		local dz = playerChunkZ - chunkZ
+
+		if dx * dx + dz * dz <= (LOAD_RADIUS + 1) ^ 2 then
+			ChunkData:FireClient(player, payload)
+		end
+	end
+end
+
+
 local function GetKey(x, z)
 	return tostring(x) .. "_" .. tostring(z)
 end
+
+--------------------------------------------------
+-- Client Request Chunk ที่มีอยู่แล้วใน Cache
+--------------------------------------------------
+
+RequestChunk.OnServerEvent:Connect(function(player, chunkX, chunkZ)
+
+	if typeof(chunkX) ~= "number"
+		or typeof(chunkZ) ~= "number"
+		or chunkX ~= math.floor(chunkX)
+		or chunkZ ~= math.floor(chunkZ)
+		or math.abs(chunkX) > 100000
+		or math.abs(chunkZ) > 100000 then
+		return
+	end
+
+	local now = os.clock()
+	local userId = player.UserId
+
+	if LastTerrainRequest[userId]
+		and now - LastTerrainRequest[userId] < TERRAIN_REQUEST_INTERVAL then
+		return
+	end
+
+	LastTerrainRequest[userId] = now
+
+	-- ตรวจสอบระยะจากตำแหน่งจริง
+	local character = player.Character
+	local root = character
+		and character:FindFirstChild("HumanoidRootPart")
+
+	if not root then
+		return
+	end
+
+	local px = math.floor(root.Position.X / CHUNK_SIZE)
+	local pz = math.floor(root.Position.Z / CHUNK_SIZE)
+
+	if math.abs(px - chunkX) > LOAD_RADIUS + 1
+		or math.abs(pz - chunkZ) > LOAD_RADIUS + 1 then
+		return
+	end
+
+	local key = GetKey(chunkX, chunkZ)
+	local payload = TerrainPayloadCache[key]
+
+	if payload then
+		ChunkData:FireClient(player, payload)
+	end
+end)
 
 -- ตัวคุมเวลา: ทุก Worker ใช้งบเวลาต่อเฟรมร่วมกัน
 local frameSpent = 0
@@ -2613,7 +2727,66 @@ local function GenerateChunk(chunkX, chunkZ)
 
 		sliceStart = ThrottleStep(sliceStart)
 	end
+	
+	--------------------------------------------------
+	-- Prepare Terrain Data For Client
+	--------------------------------------------------
 
+	local columns = table.create(total)
+
+	for i = 1, total do
+
+		columns[i] = {
+			H = colHeight[i],
+			B = colBottom[i],
+
+			R = colRock[i],
+			L = colLand[i],
+
+			S = colSurf[i].Name,
+			U = colUnder[i].Name,
+			C = colCliff[i].Name,
+		}
+
+	end
+
+	local payload = {
+		X = chunkX,
+		Z = chunkZ,
+
+		Key = key,
+
+		Seed = SEED,
+		Resolution = RES,
+
+		ChunkSize = CHUNK_SIZE,
+		Columns = COLS,
+
+		MinY = minY,
+		MaxY = maxY,
+
+		SeaLevel = SEA_LEVEL,
+
+		Data = columns,
+	}
+
+	-- เก็บไว้ให้ผู้เล่นที่เข้ามาทีหลัง Request ได้
+	TerrainPayloadCache[key] = payload
+
+	-- ส่งให้ Client ที่อยู่ใกล้ Chunk
+	SendChunkToNearbyPlayers(
+		chunkX,
+		chunkZ,
+		payload
+	)
+
+	print(
+		"[Terrain Network] Sent:",
+		key,
+		"Columns:",
+		#columns
+	)
+	
 	Terrain:WriteVoxels(region, RES, materials, occupancy)
 
 	--------------------------------------------------
@@ -2815,7 +2988,8 @@ local function RemoveChunk(chunkX, chunkZ)
 	end
 
 	LoadedChunks[key] = nil
-
+	TerrainPayloadCache[key] = nil
+	
 	RemoveChunkMobs(chunkX, chunkZ)
 end
 
@@ -3270,6 +3444,9 @@ local function ResetTerrainWorld(player)
 	table.clear(LastMapRequest)
 	table.clear(LastPlayerChunk)
 	table.clear(PlayerExploredChunks)
+	
+	table.clear(TerrainPayloadCache)
+	table.clear(LastTerrainRequest)
 
 	-- สุ่ม Seed ใหม่ (จำกัดช่วงไม่ให้ใหญ่เกินจน Noise เพี้ยน)
 	SEED = Random.new():NextInteger(1, 100000)
@@ -3411,6 +3588,8 @@ Players.PlayerRemoving:Connect(function(player)
 	PlayerExploredChunks[userId] = nil
 	LastMapRequest[userId] = nil
 	LastPositionRequest[userId] = nil
+	
+	LastTerrainRequest[player.UserId] = nil
 
 	task.delay(2, function()
 		if #Players:GetPlayers() == 0 then
