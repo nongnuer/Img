@@ -1,0 +1,3851 @@
+--------------------------------------------------
+-- TerrainServer  (Script)
+-- วางไว้ที่: ServerScriptService
+--
+-- Server: คำนวณ Terrain / Biome / Props / Mob ทั้งหมด
+-- Client: รับข้อมูลแบบ buffer แล้วสร้าง Voxel เอง (Server ไม่เขียน Terrain เลย)
+--------------------------------------------------
+
+local Players = game:GetService("Players")
+local ServerStorage = game:GetService("ServerStorage")
+local DataStoreService = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Terrain = workspace.Terrain
+
+local Shared = require(ReplicatedStorage:WaitForChild("TerrainShared"))
+local DayNightCycle = require(ReplicatedStorage:WaitForChild("DayNightCycle"))
+local MobManager = require(
+	ServerScriptService:WaitForChild("MobSystem"):WaitForChild("MobManager")
+)
+
+--------------------------------------------------
+-- Config
+--------------------------------------------------
+
+local DEBUG = false
+
+local CHUNK_SIZE = Shared.CHUNK_SIZE
+local RES = Shared.RES
+local COLS = CHUNK_SIZE / RES
+local PAD = 2
+local GRID = COLS + PAD * 2
+
+local COLUMN_BYTES = Shared.COLUMN_BYTES
+local HEIGHT_SCALE = Shared.HEIGHT_SCALE
+local MATERIAL_INDEX = Shared.MATERIAL_INDEX
+local CLIENT_LOAD_RADIUS = Shared.CLIENT_LOAD_RADIUS
+local CLIENT_UNLOAD_RADIUS = Shared.CLIENT_UNLOAD_RADIUS
+
+local LOAD_RADIUS = 2
+local UNLOAD_RADIUS = 3
+local MAX_GENERATE_WORKERS = 2
+
+local MAX_CHUNK_RETRIES = 3
+local CHUNK_RETRY_DELAY = 0.5
+local CHUNK_FAIL_COOLDOWN = 5
+local MAX_UNLOADS_PER_TICK = 6
+local MAX_MOB_CHUNKS_PER_TICK = 2
+
+-- งบเวลาสร้างโลกต่อเฟรม (รวมทุก Worker) 0.006 = 6ms
+local GENERATE_FRAME_BUDGET = 0.006
+
+-- การส่ง Terrain ให้ Client
+local STREAM_INTERVAL = 0.2
+local MAX_SENDS_PER_TICK = 3
+local MAX_LOOKAHEAD = 2
+local CLIENT_READY_TIMEOUT = 20
+
+local BOTTOM_Y = -32
+local SEED = 12345
+local UPDATE_INTERVAL = 0.5
+
+local BIOME_SCALE = 0.00010
+local BIOME_WARP_SCALE = 0.00012
+local BIOME_WARP_STRENGTH = 220
+local BIOME_BLEND = 0.22
+local CLIMATE_GAIN = 1.5
+
+-- ทะเล
+local SEA_LEVEL = 6
+local OCEAN_SCALE = 0.00045
+local OCEAN_LEVEL = -0.25
+local OCEAN_BLEND = 0.30
+local OCEAN_DEPTH = 22
+
+-- เกาะกลางมหาสมุทร
+local ISLAND_SCALE = 0.0012
+local ISLAND_THRESHOLD = 0.52
+local ISLAND_STRENGTH = 1.35
+
+-- สีน้ำ
+Terrain.WaterColor = Color3.fromRGB(40, 120, 160)
+Terrain.WaterTransparency = 0.75
+Terrain.WaterReflectance = 0.6
+Terrain.WaterWaveSize = 0.15
+Terrain.WaterWaveSpeed = 8
+
+-- ความละเอียดผิว / ความหนา
+local MIN_SKIN = 8
+local SLOPE_EXTRA_SKIN = 8
+local SLOPE_ROCK_START = 0.50
+local SLOPE_ROCK_FULL = 1.10
+local DETAIL_BASE_AMP = 1.5
+local DETAIL_ROCKY_EXTRA = 2.2
+
+local WorkspaceFolder = workspace:WaitForChild("Mobs")
+
+--------------------------------------------------
+-- Biomes
+--------------------------------------------------
+
+local function MobEntry(min, max, mode, groupMin, groupMax, radius)
+	return {
+		Min = min,
+		Max = max,
+		Mode = mode,
+		GroupMin = groupMin,
+		GroupMax = groupMax,
+		SpawnRadius = radius,
+	}
+end
+
+local DAY_ZOMBIE = MobEntry(0, 1, "Group", 1, 3, 100)
+
+local NIGHT_HORDE = {
+	Zombie = MobEntry(0, 2, "Random", 2, 4, 15),
+	Axe_Zombie = MobEntry(0, 2, "Random", 2, 4, 15),
+	Spear_Zombie = MobEntry(0, 2, "Random", 2, 4, 15),
+}
+
+local BIOMES = {
+	Rocky = {
+		ClimateMin = -1.00, ClimateMax = -0.45,
+		MinHeight = 30, MaxHeight = 140,
+		BaseHeight = 60, HeightAmplitude = 45,
+		TerrainNoiseScale = 0.012,
+		Material = Enum.Material.Rock,
+
+		Props = {
+			Coal = { Folder = "Coal", Spacing = 6, Min = 6, Max = 10 },
+			Mossy_Rock = { Folder = "Mossy_Rock", Spacing = 10, Min = 8, Max = 16 },
+		},
+
+		MobSpawns = {
+			Day = { Zombie = DAY_ZOMBIE },
+			Night = NIGHT_HORDE,
+		},
+	},
+
+	Desert = {
+		ClimateMin = -0.45, ClimateMax = -0.10,
+		MinHeight = 6, MaxHeight = 20,
+		BaseHeight = 8, HeightAmplitude = 7,
+		TerrainNoiseScale = 0.020,
+		Material = Enum.Material.Sand,
+
+		Props = {
+			Cactus = { Folder = "Cactus", Spacing = 16, Min = 3, Max = 6 },
+			Desert_Rock = { Folder = "Desert_Rock", Spacing = 22, Min = 1, Max = 3 },
+		},
+
+		MobSpawns = { Day = {}, Night = {} },
+	},
+
+	Plains = {
+		ClimateMin = -0.10, ClimateMax = 0.25,
+		MinHeight = 5, MaxHeight = 8,
+		BaseHeight = 8, HeightAmplitude = 6,
+		TerrainNoiseScale = 0.018,
+		Material = Enum.Material.Grass,
+
+		Props = {
+			Plain_Rock = { Folder = "Plain_Rock", Spacing = 16, Min = 1, Max = 4 },
+			Shrub = { Folder = "Shrub", Spacing = 20, Min = 1, Max = 2 },
+			Plain_Tree = { Folder = "Plain_Tree", Spacing = 25, Min = 2, Max = 3 },
+		},
+
+		MobSpawns = {
+			Day = {
+				Zombie = DAY_ZOMBIE,
+				Pig = MobEntry(0, 4, "Group", 1, 4, 25),
+			},
+			Night = NIGHT_HORDE,
+		},
+	},
+
+	Forest = {
+		ClimateMin = 0.25, ClimateMax = 1.00,
+		MinHeight = 15, MaxHeight = 60,
+		BaseHeight = 30, HeightAmplitude = 12,
+		TerrainNoiseScale = 0.018,
+		Material = Enum.Material.Grass,
+
+		Props = {
+			Forest_Tree = { Folder = "Forest_Tree", Spacing = 12, Min = 10, Max = 20 },
+			Mossy_Rock = { Folder = "Mossy_Rock", Spacing = 14, Min = 2, Max = 5 },
+			Shrub = { Folder = "Shrub", Spacing = 16, Min = 1, Max = 4 },
+		},
+
+		MobSpawns = { Day = {}, Night = NIGHT_HORDE },
+	},
+}
+
+-- เรียงตามชื่อ: ผลลัพธ์คงที่ทุกครั้ง และเร็วกว่า pairs()
+local BIOME_LIST = {}
+
+for name, config in pairs(BIOMES) do
+	table.insert(BIOME_LIST, { Name = name, Config = config })
+end
+
+table.sort(BIOME_LIST, function(a, b)
+	return a.Name < b.Name
+end)
+
+local MAX_TERRAIN_Y = 0
+
+for _, config in pairs(BIOMES) do
+	MAX_TERRAIN_Y = math.max(
+		MAX_TERRAIN_Y,
+		config.MaxHeight or (config.BaseHeight + config.HeightAmplitude)
+	)
+end
+
+MAX_TERRAIN_Y += 16
+
+--------------------------------------------------
+-- Key helpers
+--------------------------------------------------
+
+local function GetKey(x, z)
+	return tostring(x) .. "_" .. tostring(z)
+end
+
+--------------------------------------------------
+-- State
+--------------------------------------------------
+
+local LoadedChunks = {}        -- [key] = "Queued" | "Loading" | true
+local ChunkCache = {}          -- [key] = { Biome, Props, PlacedItems }
+local ChunkFailedUntil = {}
+local DesiredChunks = {}       -- [key] = { X, Z, P }
+
+local ChunkQueue = {}
+local QueueHead = 1
+local QueueTail = 0
+
+local ChunkMobs = {}
+local MobPending = {}          -- Chunk ที่รอให้ Client สร้าง Terrain เสร็จก่อนค่อยเกิด Mob
+
+local TerrainPayloadCache = {} -- [key] = payload ที่ส่งให้ Client
+
+-- ต่อผู้เล่น
+local SentChunks = {}          -- [userId] = { [key] = {x, z} }
+local ClientBuilt = {}         -- [userId] = { [key] = true }  Client ยืนยันว่าสร้างแล้ว
+local LastTerrainRequest = {}
+
+local IsCleaningTerrain = false
+
+-- แผนที่
+local ExploredChunks = {}
+local LastPlayerChunk = {}
+local PlayerExploredChunks = {}
+
+local function EnsureStreamState(userId)
+	local sent = SentChunks[userId]
+
+	if not sent then
+		sent = {}
+		SentChunks[userId] = sent
+		ClientBuilt[userId] = {}
+	end
+
+	return sent, ClientBuilt[userId]
+end
+
+local function AnyClientBuilt(key)
+	for _, built in pairs(ClientBuilt) do
+		if built[key] then
+			return true
+		end
+	end
+
+	return false
+end
+
+--------------------------------------------------
+-- Folders / Props cache
+--------------------------------------------------
+
+local PropsFolder = ServerStorage:WaitForChild("TerrainProps")
+local PropsFolderCache = {}
+local TemplateCache = {}
+
+local function RefreshPropsFolderCache()
+	table.clear(PropsFolderCache)
+	table.clear(TemplateCache)
+
+	for _, folder in ipairs(PropsFolder:GetChildren()) do
+		if not folder:IsA("Folder") then
+			continue
+		end
+
+		for _, item in ipairs(folder:GetDescendants()) do
+			if item:IsA("Model") or item:IsA("BasePart") then
+				PropsFolderCache[folder.Name] = folder
+				break
+			end
+		end
+	end
+end
+
+RefreshPropsFolderCache()
+PropsFolder.ChildAdded:Connect(RefreshPropsFolderCache)
+PropsFolder.ChildRemoved:Connect(RefreshPropsFolderCache)
+
+local function GetPropsFolder(folderName)
+	local folder = PropsFolderCache[folderName]
+
+	if folder and folder.Parent == PropsFolder then
+		return folder
+	end
+
+	RefreshPropsFolderCache()
+
+	return PropsFolderCache[folderName]
+end
+
+-- Template (Model) ของแต่ละโฟลเดอร์ เรียงชื่อแล้ว เก็บไว้ ไม่ต้อง GetDescendants ทุก Chunk
+local function GetTemplates(folderName, folder)
+	local cached = TemplateCache[folderName]
+
+	if cached then
+		return cached
+	end
+
+	local templates = {}
+
+	for _, item in ipairs(folder:GetDescendants()) do
+		if item:IsA("Model") then
+			table.insert(templates, item)
+		end
+	end
+
+	table.sort(templates, function(a, b)
+		return a.Name < b.Name
+	end)
+
+	TemplateCache[folderName] = templates
+
+	return templates
+end
+
+local GeneratedProps = workspace:FindFirstChild("GeneratedProps")
+
+if not GeneratedProps then
+	GeneratedProps = Instance.new("Folder")
+	GeneratedProps.Name = "GeneratedProps"
+	GeneratedProps.Parent = workspace
+end
+
+local PlacementItems = ReplicatedStorage:WaitForChild("PlacementItems")
+local PlacedItemsFolder = workspace:FindFirstChild("Item")
+
+if not PlacedItemsFolder then
+	PlacedItemsFolder = Instance.new("Folder")
+	PlacedItemsFolder.Name = "Item"
+	PlacedItemsFolder.Parent = workspace
+end
+
+--------------------------------------------------
+-- Remotes
+--------------------------------------------------
+
+local function GetOrCreate(parent, className, name)
+	local object = parent:FindFirstChild(name)
+
+	if not object then
+		object = Instance.new(className)
+		object.Name = name
+		object.Parent = parent
+	end
+
+	return object
+end
+
+local MapRemotes = GetOrCreate(ReplicatedStorage, "Folder", "WorldMapRemotes")
+local GetMapData = GetOrCreate(MapRemotes, "RemoteFunction", "GetMapData")
+local GetPlayerPositions = GetOrCreate(MapRemotes, "RemoteFunction", "GetPlayerPositions")
+
+local TerrainRemotes = GetOrCreate(ReplicatedStorage, "Folder", "TerrainRemotes")
+local RequestChunk = GetOrCreate(TerrainRemotes, "RemoteEvent", "RequestChunk")
+local ChunkData = GetOrCreate(TerrainRemotes, "RemoteEvent", "ChunkData")
+local ChunkBuilt = GetOrCreate(TerrainRemotes, "RemoteEvent", "ChunkBuilt")
+local ResetTerrainEvent = GetOrCreate(TerrainRemotes, "RemoteEvent", "ResetTerrain")
+
+local MAP_REQUEST_INTERVAL = 0.5
+local POSITION_REQUEST_INTERVAL = 0.25
+local LastMapRequest = {}
+local LastPositionRequest = {}
+
+local POSITION_SNAPSHOT_INTERVAL = 0.25
+local PositionSnapshot = {}
+local PositionSnapshotTime = 0
+
+local function RefreshPositionSnapshot()
+	local now = os.clock()
+
+	if now - PositionSnapshotTime < POSITION_SNAPSHOT_INTERVAL then
+		return
+	end
+
+	PositionSnapshotTime = now
+
+	local snapshot = {}
+
+	for _, other in ipairs(Players:GetPlayers()) do
+		local character = other.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+
+		if root then
+			local position = root.Position
+			snapshot[other.UserId] = { X = position.X, Z = position.Z }
+		end
+	end
+
+	PositionSnapshot = snapshot
+end
+
+GetPlayerPositions.OnServerInvoke = function(requestingPlayer)
+	local userId = requestingPlayer.UserId
+	local last = LastPositionRequest[userId]
+
+	if last and os.clock() - last.Time < POSITION_REQUEST_INTERVAL then
+		return last.Result
+	end
+
+	RefreshPositionSnapshot()
+
+	local positions = {}
+
+	for id, position in pairs(PositionSnapshot) do
+		if id ~= userId then
+			positions[id] = position
+		end
+	end
+
+	LastPositionRequest[userId] = { Time = os.clock(), Result = positions }
+
+	return positions
+end
+
+--------------------------------------------------
+-- Frame budget (ทุก Worker ใช้งบร่วมกัน)
+--------------------------------------------------
+
+local frameSpent = 0
+
+RunService.Heartbeat:Connect(function()
+	frameSpent = 0
+end)
+
+local function ThrottleStep(sliceStart)
+	frameSpent += os.clock() - sliceStart
+
+	if frameSpent >= GENERATE_FRAME_BUDGET then
+		task.wait()
+	end
+
+	return os.clock()
+end
+
+--------------------------------------------------
+-- Safe Zones
+--------------------------------------------------
+
+local SafeZones = workspace:WaitForChild("SafeZones")
+local SafeZoneParts = {}
+
+local function RefreshSafeZoneParts()
+	table.clear(SafeZoneParts)
+
+	for _, zone in ipairs(SafeZones:GetChildren()) do
+		if zone:IsA("BasePart") then
+			table.insert(SafeZoneParts, zone)
+		end
+	end
+end
+
+RefreshSafeZoneParts()
+SafeZones.ChildAdded:Connect(RefreshSafeZoneParts)
+SafeZones.ChildRemoved:Connect(RefreshSafeZoneParts)
+
+local TERRAIN_BLEND_MODE = "OutsideOnly" -- "OutsideOnly" | "InsideAndOutside"
+local DEFAULT_BLEND_DISTANCE = 256
+local DEFAULT_TARGET_HEIGHT = 40
+
+local function IsSafeZoneChunk(chunkX, chunkZ)
+	local minX = chunkX * CHUNK_SIZE
+	local maxX = minX + CHUNK_SIZE
+	local minZ = chunkZ * CHUNK_SIZE
+	local maxZ = minZ + CHUNK_SIZE
+
+	for _, zone in ipairs(SafeZoneParts) do
+		local zx, zz = zone.Position.X, zone.Position.Z
+		local hx, hz = zone.Size.X / 2, zone.Size.Z / 2
+
+		if minX < zx + hx and maxX > zx - hx
+			and minZ < zz + hz and maxZ > zz - hz then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function GetSafeZoneBlend(worldX, worldZ, originalHeight)
+	local bestDistance = math.huge
+	local bestTarget = originalHeight
+	local bestBlend = DEFAULT_BLEND_DISTANCE
+	local found = false
+
+	for _, zone in ipairs(SafeZoneParts) do
+		local dx = math.max(math.abs(worldX - zone.Position.X) - zone.Size.X / 2, 0)
+		local dz = math.max(math.abs(worldZ - zone.Position.Z) - zone.Size.Z / 2, 0)
+		local distance = math.sqrt(dx * dx + dz * dz)
+
+		if distance < bestDistance then
+			local target = zone:GetAttribute("TargetHeight")
+			local blend = zone:GetAttribute("BlendDistance")
+
+			bestDistance = distance
+			bestTarget = typeof(target) == "number" and target or DEFAULT_TARGET_HEIGHT
+			bestBlend = math.max(1, typeof(blend) == "number" and blend or DEFAULT_BLEND_DISTANCE)
+			found = true
+		end
+	end
+
+	if not found then
+		return originalHeight
+	end
+
+	if TERRAIN_BLEND_MODE == "OutsideOnly" and bestDistance == 0 then
+		return originalHeight
+	end
+
+	if bestDistance >= bestBlend then
+		return originalHeight
+	end
+
+	local t = math.clamp(bestDistance / bestBlend, 0, 1)
+	local alpha = 1 - t * t * (3 - 2 * t)
+
+	return originalHeight * (1 - alpha) + bestTarget * alpha
+end
+
+--------------------------------------------------
+-- Noise / Climate / Biome
+--------------------------------------------------
+
+local function Smooth(t)
+	t = math.clamp(t, 0, 1)
+	return t * t * (3 - 2 * t)
+end
+
+local function N(x, z, freq, ox, oz)
+	return math.noise(x * freq + ox, z * freq + oz)
+end
+
+local function Ridge(x, z, freq, o)
+	return 1 - math.clamp(math.abs(N(x, z, freq, o, -o)) * 2.2, 0, 1)
+end
+
+local function GetClimate(worldX, worldZ)
+	local warpX = math.noise(
+		worldX * BIOME_WARP_SCALE + SEED * 0.013,
+		worldZ * BIOME_WARP_SCALE - SEED * 0.021
+	) * BIOME_WARP_STRENGTH
+
+	local warpZ = math.noise(
+		worldX * BIOME_WARP_SCALE - SEED * 0.031,
+		worldZ * BIOME_WARP_SCALE + SEED * 0.017
+	) * BIOME_WARP_STRENGTH
+
+	local x = worldX + warpX
+	local z = worldZ + warpZ
+
+	local large = math.noise(
+		x * BIOME_SCALE + SEED * 0.01,
+		z * BIOME_SCALE - SEED * 0.02
+	)
+
+	local medium = math.noise(
+		x * BIOME_SCALE * 1.8 + SEED * 0.03,
+		z * BIOME_SCALE * 1.8 + SEED * 0.05
+	)
+
+	local detail = math.noise(
+		x * BIOME_SCALE * 3.0 - SEED * 0.04,
+		z * BIOME_SCALE * 3.0 + SEED * 0.07
+	)
+
+	local climate = large * 0.84 + medium * 0.14 + detail * 0.02
+
+	return math.clamp(climate * CLIMATE_GAIN, -1, 1)
+end
+
+local function GetBiomeFromClimate(climate)
+	local bestName, bestDist = "Plains", math.huge
+
+	for _, entry in ipairs(BIOME_LIST) do
+		local config = entry.Config
+
+		local dist = math.max(
+			config.ClimateMin - climate,
+			0,
+			climate - config.ClimateMax
+		)
+
+		if dist < bestDist then
+			bestName = entry.Name
+			bestDist = dist
+		end
+	end
+
+	return bestName
+end
+
+local function GetBiomeAtPosition(worldX, worldZ)
+	return GetBiomeFromClimate(GetClimate(worldX, worldZ))
+end
+
+local function GetBiome(chunkX, chunkZ)
+	return GetBiomeAtPosition(
+		chunkX * CHUNK_SIZE + CHUNK_SIZE / 2,
+		chunkZ * CHUNK_SIZE + CHUNK_SIZE / 2
+	)
+end
+
+--------------------------------------------------
+-- Biome Shapes (คืนค่า 0..1)
+--------------------------------------------------
+
+local BiomeShapes = {}
+
+BiomeShapes.Rocky = function(x, z, s)
+	local broad = N(x, z, s * 0.12, SEED * 0.2, SEED * 0.4)
+	local mountain = N(x, z, s * 0.35, SEED * 0.3, SEED * 0.5)
+	local ridge = Ridge(x, z, s * 0.28, SEED * 0.6)
+
+	local valley = 1 - math.clamp(
+		math.abs(N(x, z, s * 0.20, SEED * 0.7, SEED * 0.8)) * 2,
+		0,
+		1
+	)
+
+	local detail = N(x, z, s * 1.5, SEED * 0.8, SEED * 0.9)
+
+	local height = 0.43
+		+ broad * 0.20
+		+ mountain * 0.16
+		+ ridge * 0.23
+	- valley * 0.10
+		+ detail * 0.045
+
+	return math.clamp(height, 0, 1) ^ 1.12
+end
+
+BiomeShapes.Desert = function(x, z, s)
+	local u = x * 0.82 + z * 0.57
+	local v = -x * 0.57 + z * 0.82
+
+	local dune = math.noise(
+		u * s * 0.42 + SEED * 0.2,
+		v * s * 0.12 - SEED * 0.2
+	)
+
+	local duneShape = 1 - math.clamp(math.abs(dune) * 2.0, 0, 1)
+	local broad = N(x, z, s * 0.22, SEED * 0.3, SEED * 0.5)
+	local detail = N(x, z, s * 0.9, SEED * 0.6, SEED * 0.7)
+
+	local height = 0.30
+		+ broad * 0.18
+		+ duneShape * 0.30
+		+ detail * 0.045
+
+	local mesaNoise = N(x, z, 0.0028, SEED * 0.5, SEED * 0.6)
+	local mesa = Smooth((mesaNoise - 0.18) / 0.12)
+
+	height += (0.90 - height) * mesa
+
+	return math.clamp(height, 0, 1)
+end
+
+BiomeShapes.Plains = function(x, z, s)
+	local broad = N(x, z, s * 0.20, SEED * 0.4, SEED * 0.3)
+	local rolling = N(x, z, s * 0.65, SEED * 0.6, SEED * 0.2)
+	local detail = N(x, z, s * 1.4, SEED * 0.8, SEED * 0.7)
+
+	local height = 0.50
+		+ broad * 0.25
+		+ rolling * 0.13
+		+ detail * 0.045
+
+	return math.clamp(height, 0.15, 0.85)
+end
+
+BiomeShapes.Forest = function(x, z, s)
+	local broad = N(x, z, s * 0.15, SEED * 0.15, SEED * 0.35)
+	local rolling = N(x, z, s * 0.45, SEED * 0.45, SEED * 0.25)
+	local ridge = Ridge(x, z, s * 0.30, SEED * 0.65)
+
+	local valley = 1 - math.clamp(
+		math.abs(N(x, z, s * 0.22, SEED * 0.55, SEED * 0.75)) * 2,
+		0,
+		1
+	)
+
+	local detail = N(x, z, s * 1.6, SEED * 0.8, SEED * 0.1)
+
+	local height = 0.50
+		+ broad * 0.24
+		+ rolling * 0.16
+		+ ridge * 0.09
+	- valley * 0.12
+		+ detail * 0.045
+
+	return math.clamp(height, 0, 1)
+end
+
+--------------------------------------------------
+-- Continent / Height
+--------------------------------------------------
+
+local function GetContinent(worldX, worldZ)
+	local c = math.noise(
+		worldX * OCEAN_SCALE + SEED * 0.041,
+		worldZ * OCEAN_SCALE - SEED * 0.067
+	) + 0.25 * math.noise(
+		worldX * OCEAN_SCALE * 2.7 - SEED * 0.083,
+		worldZ * OCEAN_SCALE * 2.7 + SEED * 0.029
+	)
+
+	c = math.clamp(c * 1.6, -1, 1)
+
+	local islandNoise = math.noise(
+		worldX * ISLAND_SCALE + SEED * 0.137,
+		worldZ * ISLAND_SCALE - SEED * 0.219
+	) + 0.22 * math.noise(
+		worldX * ISLAND_SCALE * 2.4 - SEED * 0.173,
+		worldZ * ISLAND_SCALE * 2.4 + SEED * 0.291
+	)
+
+	islandNoise = math.clamp(islandNoise * 1.6, -1, 1)
+
+	if islandNoise > ISLAND_THRESHOLD then
+		local islandLand = OCEAN_LEVEL
+			+ (islandNoise - ISLAND_THRESHOLD) * ISLAND_STRENGTH
+
+		c = math.max(c, islandLand)
+	end
+
+	return math.clamp(c, -1, 1)
+end
+
+local function GetHeight(worldX, worldZ, climate)
+	local warpX = math.noise(
+		worldX * 0.003 + SEED * 0.11,
+		worldZ * 0.003 - SEED * 0.17
+	) * 20
+
+	local warpZ = math.noise(
+		worldX * 0.003 - SEED * 0.23,
+		worldZ * 0.003 + SEED * 0.31
+	) * 20
+
+	local wx = worldX + warpX
+	local wz = worldZ + warpZ
+
+	local totalW = 0
+	local height = 0
+
+	for _, entry in ipairs(BIOME_LIST) do
+		local config = entry.Config
+
+		local dist = math.max(
+			config.ClimateMin - climate,
+			0,
+			climate - config.ClimateMax
+		)
+
+		local w = math.max(0, 1 - dist / BIOME_BLEND)
+
+		if w > 0 then
+			local shape = BiomeShapes[entry.Name] or BiomeShapes.Plains
+			local minH = config.MinHeight or config.BaseHeight
+			local maxH = config.MaxHeight or (config.BaseHeight + config.HeightAmplitude)
+
+			height += (minH + shape(wx, wz, config.TerrainNoiseScale) * (maxH - minH)) * w
+			totalW += w
+		end
+	end
+
+	if totalW <= 0 then
+		local config = BIOMES.Plains
+		local minH = config.MinHeight or config.BaseHeight
+		local maxH = config.MaxHeight or (config.BaseHeight + config.HeightAmplitude)
+
+		height = minH + BiomeShapes.Plains(wx, wz, config.TerrainNoiseScale) * (maxH - minH)
+		totalW = 1
+	end
+
+	height /= totalW
+
+	-- มหาสมุทร: ค่อย ๆ กดพื้นลงใต้ระดับน้ำ
+	local c = GetContinent(worldX, worldZ)
+	local t = math.clamp((OCEAN_LEVEL - c) / OCEAN_BLEND, 0, 1)
+
+	if t > 0 then
+		local floorY = SEA_LEVEL - 2 - OCEAN_DEPTH * t
+		height = height + (floorY - height) * Smooth(t)
+	end
+
+	return height
+end
+
+local function GetMapBiome(chunkX, chunkZ)
+	local worldX = chunkX * CHUNK_SIZE + CHUNK_SIZE / 2
+	local worldZ = chunkZ * CHUNK_SIZE + CHUNK_SIZE / 2
+
+	local climate = GetClimate(worldX, worldZ)
+
+	if GetHeight(worldX, worldZ, climate) < SEA_LEVEL then
+		return "Ocean"
+	end
+
+	return GetBiomeFromClimate(climate)
+end
+
+local function MarkChunkExplored(chunkX, chunkZ)
+	local key = GetKey(chunkX, chunkZ)
+
+	if not ExploredChunks[key] then
+		ExploredChunks[key] = GetMapBiome(chunkX, chunkZ)
+	end
+end
+
+local function IsValidNumber(n)
+	return typeof(n) == "number" and n == n and math.abs(n) < 1000000
+end
+
+GetMapData.OnServerInvoke = function(player, centerChunkX, centerChunkZ, radius)
+	if not IsValidNumber(centerChunkX)
+		or not IsValidNumber(centerChunkZ)
+		or not IsValidNumber(radius) then
+		return {}
+	end
+
+	local userId = player.UserId
+	local last = LastMapRequest[userId]
+
+	if last and os.clock() - last.Time < MAP_REQUEST_INTERVAL then
+		return last.Result
+	end
+
+	centerChunkX = math.floor(centerChunkX)
+	centerChunkZ = math.floor(centerChunkZ)
+	radius = math.clamp(math.floor(radius), 1, 12)
+
+	local result = {}
+
+	for cx = centerChunkX - radius, centerChunkX + radius do
+		for cz = centerChunkZ - radius, centerChunkZ + radius do
+			local key = GetKey(cx, cz)
+			local biome = ExploredChunks[key]
+
+			if biome then
+				result[key] = biome
+			end
+		end
+	end
+
+	LastMapRequest[userId] = { Time = os.clock(), Result = result }
+
+	return result
+end
+
+--------------------------------------------------
+-- Surface sampling + Materials
+--------------------------------------------------
+
+local Mat = Enum.Material
+
+local function SampleSurface(worldX, worldZ)
+	local climate = GetClimate(worldX, worldZ)
+	local h = GetHeight(worldX, worldZ, climate)
+
+	if h > SEA_LEVEL then
+		local fade = Smooth((h - SEA_LEVEL - 1) / 3)
+
+		if fade > 0 then
+			local amp = DETAIL_BASE_AMP
+				+ DETAIL_ROCKY_EXTRA * Smooth((-0.25 - climate) / 0.5)
+
+			local d = math.noise(
+				worldX * 0.045 + SEED * 0.91,
+				worldZ * 0.045 - SEED * 0.83
+			) + 0.45 * math.noise(
+				worldX * 0.11 - SEED * 0.37,
+				worldZ * 0.11 + SEED * 0.59
+			)
+
+			h += d * amp * 2 * fade
+		end
+	end
+
+	h = GetSafeZoneBlend(worldX, worldZ, h)
+
+	return h, climate
+end
+
+-- ให้สคริปต์อื่นฝั่ง Server ถามความสูงพื้นได้ (เพราะ Server ไม่มี Terrain จริง)
+local GetGroundHeightFn = Instance.new("BindableFunction")
+GetGroundHeightFn.Name = "GetGroundHeight"
+GetGroundHeightFn.Parent = ServerStorage
+
+GetGroundHeightFn.OnInvoke = function(worldX, worldZ)
+	return (SampleSurface(worldX, worldZ))
+end
+
+local function PickMaterials(biomeName, biomeConfig, height, worldX, worldZ)
+	local patch = math.noise(
+		worldX * 0.02 + SEED * 0.71,
+		worldZ * 0.02 - SEED * 0.29
+	)
+
+	local detail = math.noise(
+		worldX * 0.09 - SEED * 0.13,
+		worldZ * 0.09 + SEED * 0.47
+	)
+
+	local cliff
+
+	if patch > 0.25 then
+		cliff = Mat.Slate
+	elseif patch < -0.25 then
+		cliff = Mat.Basalt
+	else
+		cliff = Mat.Rock
+	end
+
+	if biomeName == "Desert" then
+		cliff = Mat.Sandstone
+	end
+
+	local surface
+
+	if height < SEA_LEVEL - 7 + patch * 3 then
+		surface = Mat.Mud
+
+	elseif biomeName ~= "Plains"
+		and height < SEA_LEVEL + 2.5 + detail * 1.5 then
+		surface = Mat.Sand
+
+	elseif biomeName == "Rocky" then
+		if height > 110 + patch * 10 then
+			surface = Mat.Snow
+		elseif height > 85 + patch * 8 then
+			surface = Mat.Slate
+		elseif height < 70 and patch < -0.15 then
+			surface = Mat.Ground
+		else
+			surface = Mat.Rock
+		end
+
+	elseif biomeName == "Forest" then
+		if height > 48 + patch * 5 then
+			surface = Mat.Ground
+		elseif height < 23 or patch > 0.18 then
+			surface = Mat.LeafyGrass
+		else
+			surface = Mat.Grass
+		end
+
+	elseif biomeName == "Plains" then
+		if height < 6 then
+			surface = Mat.Ground
+		elseif patch > 0.22 then
+			surface = Mat.LeafyGrass
+		else
+			surface = Mat.Grass
+		end
+
+	elseif biomeName == "Desert" then
+		if height > 15 and patch > 0 then
+			surface = Mat.Sandstone
+		else
+			surface = Mat.Sand
+		end
+
+	else
+		surface = biomeConfig.Material
+	end
+
+	local under = surface
+
+	if surface == Mat.Grass or surface == Mat.LeafyGrass then
+		under = Mat.Ground
+	elseif surface == Mat.Sand and biomeName == "Desert" then
+		under = Mat.Sandstone
+	elseif surface == Mat.Snow then
+		under = Mat.Rock
+	end
+
+	return surface, under, cliff
+end
+
+--------------------------------------------------
+-- Chunk data (Props ที่จะวาง) : คำนวณจาก Seed ได้ผลเดิมเสมอ จึงไม่ต้องเซฟ
+--------------------------------------------------
+
+local function GetRandom(seed)
+	return Random.new(seed % 2147483647)
+end
+
+local function AddProps(data, random, chunkX, chunkZ, biome, propConfig)
+	local folderName = propConfig.Folder
+	local folder = GetPropsFolder(folderName)
+
+	if not folder then
+		return
+	end
+
+	local spacing = propConfig.Spacing
+
+	if type(spacing) ~= "number" or spacing <= 0 then
+		return
+	end
+
+	local templates = GetTemplates(folderName, folder)
+
+	if #templates == 0 then
+		return
+	end
+
+	local cells = math.max(1, math.ceil(CHUNK_SIZE / spacing))
+	local positions = {}
+
+	for gx = 0, cells - 1 do
+		for gz = 0, cells - 1 do
+			table.insert(positions, {
+				X = chunkX * CHUNK_SIZE + math.min((gx + 0.5) * spacing, CHUNK_SIZE - 2),
+				Z = chunkZ * CHUNK_SIZE + math.min((gz + 0.5) * spacing, CHUNK_SIZE - 2),
+			})
+		end
+	end
+
+	for i = #positions, 2, -1 do
+		local j = random:NextInteger(1, i)
+		positions[i], positions[j] = positions[j], positions[i]
+	end
+
+	local lo = math.min(propConfig.Min, propConfig.Max)
+	local hi = math.max(propConfig.Min, propConfig.Max)
+	local targetCount = math.min(random:NextInteger(lo, hi), #positions)
+	local placed = 0
+
+	for i = 1, #positions do
+		if placed >= targetCount then
+			break
+		end
+
+		local position = positions[i]
+
+		if GetBiomeAtPosition(position.X, position.Z) == biome then
+			local template = templates[random:NextInteger(1, #templates)]
+
+			table.insert(data.Props, {
+				Name = template.Name,
+				Template = template,
+				Category = folderName,
+				X = position.X,
+				Z = position.Z,
+				Rotation = random:NextInteger(0, 359),
+			})
+
+			placed += 1
+		end
+	end
+end
+
+local function BuildChunkData(chunkX, chunkZ)
+	local random = GetRandom(chunkX * 73856093 + chunkZ * 19349663 + SEED)
+
+	local data = {
+		Biome = GetBiome(chunkX, chunkZ),
+		Props = {},
+	}
+
+	local biomeConfig = BIOMES[data.Biome] or BIOMES.Plains
+	local categories = {}
+
+	if type(biomeConfig.Props) == "table" then
+		for category in pairs(biomeConfig.Props) do
+			table.insert(categories, category)
+		end
+	end
+
+	table.sort(categories)
+
+	for _, category in ipairs(categories) do
+		local propConfig = biomeConfig.Props[category]
+
+		if type(propConfig) == "table" then
+			AddProps(data, random, chunkX, chunkZ, data.Biome, propConfig)
+		end
+	end
+
+	return data
+end
+
+local function LoadChunkData(chunkX, chunkZ)
+	local key = GetKey(chunkX, chunkZ)
+	local cached = ChunkCache[key]
+
+	if cached then
+		return cached
+	end
+
+	local ok, result = pcall(BuildChunkData, chunkX, chunkZ)
+
+	if not ok then
+		warn("LoadChunkData error:", key, result)
+		return nil
+	end
+
+	ChunkCache[key] = result
+
+	return result
+end
+
+--------------------------------------------------
+-- Placed Items
+--------------------------------------------------
+
+local function SavePlacedItems(chunkX, chunkZ)
+	local key = GetKey(chunkX, chunkZ)
+	local data = ChunkCache[key]
+
+	if not data then
+		return
+	end
+
+	data.PlacedItems = {}
+
+	for _, item in ipairs(PlacedItemsFolder:GetChildren()) do
+		if not item:IsA("Model") then
+			continue
+		end
+
+		local position = item:GetPivot().Position
+
+		if math.floor(position.X / CHUNK_SIZE) == chunkX
+			and math.floor(position.Z / CHUNK_SIZE) == chunkZ then
+
+			table.insert(data.PlacedItems, {
+				Name = item.Name,
+				Pivot = item:GetPivot(),
+			})
+
+			item:Destroy()
+		end
+	end
+end
+
+local function LoadPlacedItems(chunkX, chunkZ)
+	local key = GetKey(chunkX, chunkZ)
+	local data = ChunkCache[key]
+
+	if not data or type(data.PlacedItems) ~= "table" then
+		return
+	end
+
+	for _, saved in ipairs(data.PlacedItems) do
+		if type(saved) ~= "table"
+			or type(saved.Name) ~= "string"
+			or typeof(saved.Pivot) ~= "CFrame" then
+			continue
+		end
+
+		local template = PlacementItems:FindFirstChild(saved.Name)
+
+		if not template or not template:IsA("Model") then
+			warn("[Placement] Missing Template:", saved.Name)
+			continue
+		end
+
+		local item = template:Clone()
+		item:PivotTo(saved.Pivot)
+		item:SetAttribute("PlacementChunkKey", key)
+
+		for _, part in ipairs(item:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.Anchored = true
+				part.CanCollide = true
+				part.CanTouch = true
+				part.CanQuery = true
+			end
+		end
+
+		item.Parent = PlacedItemsFolder
+	end
+end
+
+--------------------------------------------------
+-- Generate Props (Instance) : แบ่งงานข้ามเฟรม
+--------------------------------------------------
+
+local function GenerateProps(chunkX, chunkZ, data)
+	local key = GetKey(chunkX, chunkZ)
+
+	local old = GeneratedProps:FindFirstChild(key)
+
+	if old then
+		old:Destroy()
+	end
+
+	local chunkFolder = Instance.new("Folder")
+	chunkFolder.Name = key
+	chunkFolder.Parent = GeneratedProps
+
+	local typeFolders = {}
+	local categoryInfo = {}
+	local sliceStart = os.clock()
+
+	for _, savedProp in ipairs(data.Props) do
+		local category = savedProp.Category
+		local info = categoryInfo[category]
+
+		if info == nil then
+			local folder = category and GetPropsFolder(category)
+
+			if folder then
+				info = {
+					Attributes = folder:GetAttributes(),
+					Type = folder:GetAttribute("Type") or "Default",
+				}
+			else
+				info = false
+			end
+
+			categoryInfo[category] = info
+		end
+
+		local template = savedProp.Template
+
+		if info
+			and template
+			and template.Parent
+			and (template:IsA("Model") or template:IsA("BasePart")) then
+
+			local groundY = SampleSurface(savedProp.X, savedProp.Z)
+
+			if groundY > SEA_LEVEL + 1
+				and GetBiomeAtPosition(savedProp.X, savedProp.Z) == data.Biome then
+
+				local prop = template:Clone()
+
+				for name, value in pairs(info.Attributes) do
+					prop:SetAttribute(name, value)
+				end
+
+				if prop:IsA("BasePart") then
+					prop.Anchored = true
+				end
+
+				for _, object in ipairs(prop:GetDescendants()) do
+					if object:IsA("BasePart") then
+						object.Anchored = true
+					end
+				end
+
+				local target = CFrame.new(savedProp.X, groundY, savedProp.Z)
+					* CFrame.Angles(0, math.rad(savedProp.Rotation or 0), 0)
+
+				if prop:IsA("Model") then
+					prop:PivotTo(target)
+				else
+					prop.CFrame = target
+				end
+
+				local typeFolder = typeFolders[info.Type]
+
+				if not typeFolder then
+					typeFolder = Instance.new("Folder")
+					typeFolder.Name = info.Type
+					typeFolder.Parent = chunkFolder
+					typeFolders[info.Type] = typeFolder
+				end
+
+				prop.Parent = typeFolder
+			end
+		end
+
+		sliceStart = ThrottleStep(sliceStart)
+	end
+
+	return true
+end
+
+--------------------------------------------------
+-- Mobs
+--------------------------------------------------
+
+local MobSpawnWarned = false
+
+-- ปรับฟังก์ชันนี้ให้ตรงกับ MobManager ของคุณ
+-- (ลองหา Spawn / SpawnMob / Create ให้อัตโนมัติ)
+local function SpawnMobAt(mobName, position)
+	local spawnFn = MobManager.Spawn or MobManager.SpawnMob or MobManager.Create
+
+	if not spawnFn then
+		if not MobSpawnWarned then
+			MobSpawnWarned = true
+			warn("[MobSpawner] MobManager ไม่มีฟังก์ชัน Spawn/SpawnMob/Create -> แก้ SpawnMobAt() ให้ตรงกับระบบของคุณ")
+		end
+
+		return nil
+	end
+
+	local ok, mob = pcall(spawnFn, mobName, position)
+
+	if not ok then
+		warn("[MobSpawner] Spawn failed:", mobName, mob)
+		return nil
+	end
+
+	return mob
+end
+
+local function GenerateMobs(chunkX, chunkZ, data)
+	local key = GetKey(chunkX, chunkZ)
+
+	if ChunkMobs[key] then
+		return
+	end
+
+	local spawned = {}
+	ChunkMobs[key] = spawned
+
+	local biomeConfig = BIOMES[data.Biome]
+
+	if not biomeConfig or not biomeConfig.MobSpawns then
+		return
+	end
+
+	local period = DayNightCycle.IsNight() and "Night" or "Day"
+	local mobSpawnConfig = biomeConfig.MobSpawns[period]
+
+	if not mobSpawnConfig then
+		return
+	end
+
+	local random = GetRandom(chunkX * 73856093 + chunkZ * 19349663 + SEED + 98765)
+
+	local startX = chunkX * CHUNK_SIZE
+	local startZ = chunkZ * CHUNK_SIZE
+
+	local mobNames = {}
+
+	for mobName in pairs(mobSpawnConfig) do
+		table.insert(mobNames, mobName)
+	end
+
+	table.sort(mobNames)
+
+	for _, mobName in ipairs(mobNames) do
+		local config = mobSpawnConfig[mobName]
+
+		local minAmount = math.max(0, config.Min or 0)
+		local maxAmount = math.max(minAmount, config.Max or 0)
+		local remaining = random:NextInteger(minAmount, maxAmount)
+
+		while remaining > 0 do
+			local mode = config.Mode or "Random"
+
+			if mode == "Random" then
+				mode = random:NextNumber() < 0.5 and "Group" or "Single"
+			end
+
+			local groupAmount = 1
+
+			if mode == "Group" then
+				local groupMin = math.max(1, config.GroupMin or 2)
+				local groupMax = math.max(groupMin, config.GroupMax or 4)
+				groupAmount = random:NextInteger(groupMin, groupMax)
+			elseif mode ~= "Single" then
+				warn("[MobSpawner] Invalid Mode:", mode)
+			end
+
+			groupAmount = math.min(groupAmount, remaining)
+
+			local centerX = startX + random:NextNumber(12, CHUNK_SIZE - 12)
+			local centerZ = startZ + random:NextNumber(12, CHUNK_SIZE - 12)
+			local spawnRadius = config.SpawnRadius or 20
+
+			for _ = 1, groupAmount do
+				local x = centerX
+				local z = centerZ
+
+				if groupAmount > 1 then
+					x += random:NextNumber(-spawnRadius, spawnRadius)
+					z += random:NextNumber(-spawnRadius, spawnRadius)
+				end
+
+				x = math.clamp(x, startX + 4, startX + CHUNK_SIZE - 4)
+				z = math.clamp(z, startZ + 4, startZ + CHUNK_SIZE - 4)
+
+				local groundY = SampleSurface(x, z)
+
+				if groundY > SEA_LEVEL + 1 then
+					local mob = SpawnMobAt(mobName, Vector3.new(x, groundY + 3, z))
+
+					if mob then
+						table.insert(spawned, mob)
+					end
+				end
+			end
+
+			remaining -= groupAmount
+		end
+	end
+
+	if DEBUG then
+		print("[MobSpawner]", key, "Spawned:", #spawned)
+	end
+end
+
+local function RemoveChunkMobs(chunkX, chunkZ)
+	local key = GetKey(chunkX, chunkZ)
+	local mobs = ChunkMobs[key]
+
+	if not mobs then
+		return
+	end
+
+	for _, mob in ipairs(mobs) do
+		if mob and mob.Parent then
+			MobManager.Remove(mob)
+		end
+	end
+
+	ChunkMobs[key] = nil
+end
+
+-- Mob จะเกิดเมื่อ Client อย่างน้อยหนึ่งคนสร้าง Terrain ของ Chunk นั้นเสร็จแล้วเท่านั้น
+-- (ไม่งั้น Mob ที่ Client ถือ Physics อยู่จะตกทะลุพื้นที่ยังไม่ถูกสร้าง)
+local function ProcessPendingMobs()
+	local processed = 0
+
+	for key, info in pairs(MobPending) do
+		local state = LoadedChunks[key]
+
+		if state == nil then
+			MobPending[key] = nil
+
+		elseif state == true and AnyClientBuilt(key) then
+			MobPending[key] = nil
+
+			local data = ChunkCache[key]
+
+			if data then
+				local ok, err = pcall(GenerateMobs, info.X, info.Z, data)
+
+				if not ok then
+					warn("[MobSpawner] Error:", key, err)
+				end
+			end
+
+			processed += 1
+
+			if processed >= MAX_MOB_CHUNKS_PER_TICK then
+				break
+			end
+		end
+	end
+end
+
+task.spawn(function()
+	local lastPeriod = DayNightCycle.IsNight()
+
+	while true do
+		task.wait(2)
+
+		local current = DayNightCycle.IsNight()
+
+		if current ~= lastPeriod then
+			lastPeriod = current
+
+			local keys = {}
+
+			for key, state in pairs(LoadedChunks) do
+				if state == true then
+					table.insert(keys, key)
+				end
+			end
+
+			for _, key in ipairs(keys) do
+				local chunkX, chunkZ = string.match(key, "^(-?%d+)_(-?%d+)$")
+				chunkX, chunkZ = tonumber(chunkX), tonumber(chunkZ)
+
+				if chunkX and chunkZ and ChunkCache[key] then
+					RemoveChunkMobs(chunkX, chunkZ)
+					MobPending[key] = { X = chunkX, Z = chunkZ }
+				end
+
+				task.wait(0.05)
+			end
+		end
+	end
+end)
+
+--------------------------------------------------
+-- Generate Chunk  (คำนวณอย่างเดียว ไม่เขียน Terrain)
+--------------------------------------------------
+
+local function GenerateChunk(chunkX, chunkZ)
+	local key = GetKey(chunkX, chunkZ)
+
+	-- Chunk ที่ทับ Safe Zone: ไม่มี Terrain, ส่งแค่ตัวบอกว่า "ว่าง"
+	if TERRAIN_BLEND_MODE == "OutsideOnly" and IsSafeZoneChunk(chunkX, chunkZ) then
+		TerrainPayloadCache[key] = { X = chunkX, Z = chunkZ, Empty = true }
+		return true
+	end
+
+	local data = LoadChunkData(chunkX, chunkZ)
+
+	if not data then
+		return false
+	end
+
+	local startX = chunkX * CHUNK_SIZE
+	local startZ = chunkZ * CHUNK_SIZE
+
+	--------------------------------------------------
+	-- Pass 1: Height Grid (รวมขอบ)
+	--------------------------------------------------
+
+	local heightGrid = table.create(GRID * GRID, 0)
+	local climateGrid = table.create(GRID * GRID, 0)
+
+	local sliceStart = os.clock()
+
+	for gx = 0, GRID - 1 do
+		local worldX = startX + (gx - PAD + 0.5) * RES
+
+		for gz = 0, GRID - 1 do
+			local worldZ = startZ + (gz - PAD + 0.5) * RES
+			local h, c = SampleSurface(worldX, worldZ)
+			local i = gx * GRID + gz + 1
+
+			heightGrid[i] = h
+			climateGrid[i] = c
+		end
+
+		sliceStart = ThrottleStep(sliceStart)
+	end
+
+	--------------------------------------------------
+	-- Pass 2: เขียนข้อมูลคอลัมน์ลง buffer ตรง ๆ
+	--------------------------------------------------
+
+	local total = COLS * COLS
+	local buf = buffer.create(total * COLUMN_BYTES)
+
+	local minBottom = math.huge
+	local maxTop = -math.huge
+
+	for cx = 0, COLS - 1 do
+		local gx = cx + PAD
+		local worldX = startX + (cx + 0.5) * RES
+
+		for cz = 0, COLS - 1 do
+			local gz = cz + PAD
+			local worldZ = startZ + (cz + 0.5) * RES
+
+			local gi = gx * GRID + gz + 1
+			local height = heightGrid[gi]
+			local climate = climateGrid[gi]
+
+			local isLand = height > SEA_LEVEL + 1
+			local rockAlpha = 0
+
+			if isLand then
+				local left = heightGrid[(gx - 2) * GRID + gz + 1]
+				local right = heightGrid[(gx + 2) * GRID + gz + 1]
+				local back = heightGrid[gx * GRID + (gz - 2) + 1]
+				local front = heightGrid[gx * GRID + (gz + 2) + 1]
+
+				local sx = (right - left) / (4 * RES)
+				local sz = (front - back) / (4 * RES)
+				local slope = math.sqrt(sx * sx + sz * sz)
+
+				rockAlpha = Smooth(
+					(slope - SLOPE_ROCK_START) / (SLOPE_ROCK_FULL - SLOPE_ROCK_START)
+				)
+			end
+
+			local minNeighbor = height
+
+			for dx = -PAD, PAD do
+				local base = (gx + dx) * GRID + gz + 1
+
+				for dz = -PAD, PAD do
+					local v = heightGrid[base + dz]
+
+					if v < minNeighbor then
+						minNeighbor = v
+					end
+				end
+			end
+
+			local bottom = math.max(
+				BOTTOM_Y,
+				minNeighbor - MIN_SKIN - rockAlpha * SLOPE_EXTRA_SKIN
+			)
+
+			local biomeName = GetBiomeFromClimate(climate)
+			local biomeConfig = BIOMES[biomeName] or BIOMES.Plains
+
+			local surf, under, cliff = PickMaterials(
+				biomeName,
+				biomeConfig,
+				height,
+				worldX,
+				worldZ
+			)
+
+			local o = (cx * COLS + cz) * COLUMN_BYTES
+
+			buffer.writei16(buf, o, math.clamp(math.round(height * HEIGHT_SCALE), -32768, 32767))
+			buffer.writei16(buf, o + 2, math.clamp(math.round(bottom * HEIGHT_SCALE), -32768, 32767))
+			buffer.writeu8(buf, o + 4, math.clamp(math.floor(rockAlpha * 255 + 0.5), 0, 255))
+			buffer.writeu8(buf, o + 5, isLand and 1 or 0)
+			buffer.writeu8(buf, o + 6, MATERIAL_INDEX[surf] or 3)
+			buffer.writeu8(buf, o + 7, MATERIAL_INDEX[under] or 5)
+			buffer.writeu8(buf, o + 8, MATERIAL_INDEX[cliff] or 6)
+
+			if bottom < minBottom then
+				minBottom = bottom
+			end
+
+			local top = height < SEA_LEVEL and SEA_LEVEL or height
+
+			if top > maxTop then
+				maxTop = top
+			end
+		end
+
+		sliceStart = ThrottleStep(sliceStart)
+	end
+
+	local minY = math.max(BOTTOM_Y, math.floor(minBottom / RES) * RES)
+	local maxY = math.ceil(maxTop / RES) * RES + RES
+
+	-- เก็บไว้ให้ Streamer ส่งต่อ (ไม่ได้ส่งทันที เพื่อให้ส่งตามระยะและจำกัดอัตรา)
+	TerrainPayloadCache[key] = {
+		X = chunkX,
+		Z = chunkZ,
+		MinY = minY,
+		MaxY = maxY,
+		SeaLevel = SEA_LEVEL,
+		Data = buf,
+	}
+
+	--------------------------------------------------
+	-- Props / Placed Items
+	--------------------------------------------------
+
+	GenerateProps(chunkX, chunkZ, data)
+	LoadPlacedItems(chunkX, chunkZ)
+
+	-- Mob รอ Client สร้าง Terrain ก่อน
+	MobPending[key] = { X = chunkX, Z = chunkZ }
+
+	return true
+end
+
+--------------------------------------------------
+-- Chunk Worker
+--------------------------------------------------
+
+local function ChunkWorker()
+	while true do
+		if IsCleaningTerrain then
+			task.wait(0.25)
+			continue
+		end
+
+		if QueueHead > QueueTail then
+			task.wait(0.1)
+			continue
+		end
+
+		local bestIndex = nil
+		local bestDistance = math.huge
+
+		for i = QueueHead, QueueTail do
+			local candidate = ChunkQueue[i]
+
+			if candidate then
+				local key = candidate.Key
+
+				if LoadedChunks[key] ~= "Queued" then
+					ChunkQueue[i] = nil
+
+				elseif not DesiredChunks[key] then
+					LoadedChunks[key] = nil
+					ChunkQueue[i] = nil
+
+				else
+					local distance = DesiredChunks[key].P or math.huge
+
+					if distance < bestDistance then
+						bestDistance = distance
+						bestIndex = i
+					end
+				end
+			end
+		end
+
+		local job
+
+		if bestIndex then
+			job = ChunkQueue[bestIndex]
+			ChunkQueue[bestIndex] = nil
+		end
+
+		while QueueHead <= QueueTail and not ChunkQueue[QueueHead] do
+			QueueHead += 1
+		end
+
+		if QueueHead > QueueTail then
+			table.clear(ChunkQueue)
+			QueueHead = 1
+			QueueTail = 0
+		end
+
+		if not job then
+			task.wait(0.1)
+			continue
+		end
+
+		local key = job.Key
+		LoadedChunks[key] = "Loading"
+
+		local loaded = false
+
+		for attempt = 1, MAX_CHUNK_RETRIES do
+			local success, result = pcall(GenerateChunk, job.X, job.Z)
+
+			if success and result == true then
+				loaded = true
+				break
+			end
+
+			warn(string.format(
+				"[Chunk] %s failed (%d/%d): %s",
+				key, attempt, MAX_CHUNK_RETRIES, tostring(result)
+				))
+
+			local folder = GeneratedProps:FindFirstChild(key)
+
+			if folder then
+				folder:Destroy()
+			end
+
+			if attempt < MAX_CHUNK_RETRIES then
+				task.wait(CHUNK_RETRY_DELAY)
+			end
+		end
+
+		if loaded then
+			LoadedChunks[key] = true
+			ChunkFailedUntil[key] = nil
+		else
+			LoadedChunks[key] = nil
+			TerrainPayloadCache[key] = nil
+			MobPending[key] = nil
+			ChunkFailedUntil[key] = os.clock() + CHUNK_FAIL_COOLDOWN
+
+			warn("[Chunk] Failed after all retries:", key)
+		end
+	end
+end
+
+for _ = 1, MAX_GENERATE_WORKERS do
+	task.spawn(ChunkWorker)
+end
+
+--------------------------------------------------
+-- Remove Chunk (ฝั่ง Server ไม่มี Terrain ให้ลบ ลบแค่ข้อมูล/Props/Mob)
+--------------------------------------------------
+
+local function RemoveChunk(chunkX, chunkZ)
+	local key = GetKey(chunkX, chunkZ)
+
+	SavePlacedItems(chunkX, chunkZ)
+
+	local folder = GeneratedProps:FindFirstChild(key)
+
+	if folder then
+		folder:Destroy()
+	end
+
+	local data = ChunkCache[key]
+
+	if data and (type(data.PlacedItems) ~= "table" or #data.PlacedItems == 0) then
+		ChunkCache[key] = nil
+	end
+
+	LoadedChunks[key] = nil
+	TerrainPayloadCache[key] = nil
+	MobPending[key] = nil
+
+	RemoveChunkMobs(chunkX, chunkZ)
+end
+
+--------------------------------------------------
+-- Player chunk helper
+--------------------------------------------------
+
+local function GetPlayerChunk(player)
+	local character = player.Character
+
+	if not character then
+		return nil
+	end
+
+	local root = character:FindFirstChild("HumanoidRootPart")
+
+	if not root then
+		return nil
+	end
+
+	return math.floor(root.Position.X / CHUNK_SIZE), math.floor(root.Position.Z / CHUNK_SIZE)
+end
+
+--------------------------------------------------
+-- Crowd Settings
+--------------------------------------------------
+
+local function GetCrowdSettings(playerCount)
+	if playerCount <= 40 then
+		return { Radius = LOAD_RADIUS, MaxExtra = 2, MaxLookAhead = 5, Unload = UNLOAD_RADIUS }
+	elseif playerCount <= 70 then
+		return { Radius = LOAD_RADIUS, MaxExtra = 1, MaxLookAhead = 3, Unload = LOAD_RADIUS + 1 }
+	else
+		return { Radius = 1, MaxExtra = 1, MaxLookAhead = 2, Unload = 2 }
+	end
+end
+
+--------------------------------------------------
+-- Terrain Streaming: Server -> Client
+--  * ส่งเฉพาะ Chunk ที่ผู้เล่นคนนั้นยังไม่มี
+--  * เรียงใกล้ก่อน จำกัดจำนวนต่อรอบ
+--  * จำว่าส่งอะไรไปแล้ว ไม่ส่งซ้ำ
+--------------------------------------------------
+
+local function Consider(candidates, seen, sent, cx, cz, x, z)
+	local key = GetKey(x, z)
+
+	if seen[key] then
+		return
+	end
+
+	seen[key] = true
+
+	if sent[key] then
+		return
+	end
+
+	local payload = TerrainPayloadCache[key]
+
+	if not payload then
+		return
+	end
+
+	local dx, dz = x - cx, z - cz
+
+	table.insert(candidates, {
+		Key = key,
+		X = x,
+		Z = z,
+		D = dx * dx + dz * dz,
+		Payload = payload,
+	})
+end
+
+local function StreamToPlayer(player, radius)
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+
+	if not root then
+		return
+	end
+
+	local position = root.Position
+	local cx = math.floor(position.X / CHUNK_SIZE)
+	local cz = math.floor(position.Z / CHUNK_SIZE)
+
+	local sent, built = EnsureStreamState(player.UserId)
+
+	-- Client จะลบ Chunk ที่ไกลเกินระยะนี้เอง -> ลืมไว้ เผื่อกลับมาต้องส่งใหม่
+	for key, coord in pairs(sent) do
+		if math.max(math.abs(coord[1] - cx), math.abs(coord[2] - cz)) > CLIENT_UNLOAD_RADIUS then
+			sent[key] = nil
+			built[key] = nil
+		end
+	end
+
+	local candidates = {}
+	local seen = {}
+	local limit = radius * radius + 1
+
+	for dx = -radius, radius do
+		for dz = -radius, radius do
+			if dx * dx + dz * dz <= limit then
+				Consider(candidates, seen, sent, cx, cz, cx + dx, cz + dz)
+			end
+		end
+	end
+
+	-- โหลดล่วงหน้าด้านหน้าเมื่อเคลื่อนที่เร็ว
+	local velocity = root.AssemblyLinearVelocity
+	local flat = Vector3.new(velocity.X, 0, velocity.Z)
+
+	if flat.Magnitude > 20 then
+		local direction = flat.Unit
+		local steps = math.min(MAX_LOOKAHEAD, math.floor(flat.Magnitude / 40))
+
+		for step = 1, steps do
+			local ax = math.floor((position.X + direction.X * CHUNK_SIZE * step) / CHUNK_SIZE)
+			local az = math.floor((position.Z + direction.Z * CHUNK_SIZE * step) / CHUNK_SIZE)
+
+			for ox = -1, 1 do
+				for oz = -1, 1 do
+					Consider(candidates, seen, sent, cx, cz, ax + ox, az + oz)
+				end
+			end
+		end
+	end
+
+	if #candidates == 0 then
+		return
+	end
+
+	table.sort(candidates, function(a, b)
+		return a.D < b.D
+	end)
+
+	for i = 1, math.min(#candidates, MAX_SENDS_PER_TICK) do
+		local candidate = candidates[i]
+
+		sent[candidate.Key] = { candidate.X, candidate.Z }
+		ChunkData:FireClient(player, candidate.Payload)
+	end
+end
+
+task.spawn(function()
+	while true do
+		task.wait(STREAM_INTERVAL)
+
+		local players = Players:GetPlayers()
+		local radius = math.min(CLIENT_LOAD_RADIUS, GetCrowdSettings(#players).Radius)
+
+		for _, player in ipairs(players) do
+			local ok, err = pcall(StreamToPlayer, player, radius)
+
+			if not ok then
+				warn("[Stream] Error:", player.Name, err)
+			end
+		end
+	end
+end)
+
+-- Client ขอ Chunk ซ้ำ (กรณีแพ็กเก็ตหาย / ยังไม่ได้เชื่อม Event ตอนส่ง)
+RequestChunk.OnServerEvent:Connect(function(player, chunkX, chunkZ)
+	if typeof(chunkX) ~= "number"
+		or typeof(chunkZ) ~= "number"
+		or chunkX ~= math.floor(chunkX)
+		or chunkZ ~= math.floor(chunkZ)
+		or math.abs(chunkX) > 100000
+		or math.abs(chunkZ) > 100000 then
+		return
+	end
+
+	local now = os.clock()
+	local userId = player.UserId
+
+	if LastTerrainRequest[userId] and now - LastTerrainRequest[userId] < 0.2 then
+		return
+	end
+
+	LastTerrainRequest[userId] = now
+
+	local px, pz = GetPlayerChunk(player)
+
+	if not px
+		or math.abs(px - chunkX) > CLIENT_LOAD_RADIUS + 1
+		or math.abs(pz - chunkZ) > CLIENT_LOAD_RADIUS + 1 then
+		return
+	end
+
+	local key = GetKey(chunkX, chunkZ)
+	local payload = TerrainPayloadCache[key]
+
+	if payload then
+		local sent = EnsureStreamState(userId)
+		sent[key] = { chunkX, chunkZ }
+
+		ChunkData:FireClient(player, payload)
+	end
+end)
+
+-- Client บอกว่าสร้าง Chunk นี้เสร็จแล้ว
+ChunkBuilt.OnServerEvent:Connect(function(player, key)
+	if typeof(key) ~= "string" or #key > 24 then
+		return
+	end
+
+	local userId = player.UserId
+	local sent = SentChunks[userId]
+
+	if sent and sent[key] then
+		ClientBuilt[userId][key] = true
+	end
+end)
+
+local WaitForTerrainChunk = Instance.new("BindableFunction")
+WaitForTerrainChunk.Name = "WaitForTerrainChunk"
+WaitForTerrainChunk.Parent = ServerStorage
+
+WaitForTerrainChunk.OnInvoke = function(worldX, worldZ)
+	local key = GetKey(math.floor(worldX / CHUNK_SIZE), math.floor(worldZ / CHUNK_SIZE))
+	local timeout = os.clock() + 60
+
+	while os.clock() < timeout do
+		if LoadedChunks[key] == true then
+			return true
+		end
+
+		task.wait(0.1)
+	end
+
+	return false
+end
+
+local function WaitForClientTerrain(player, worldX, worldZ, timeout)
+	local key = GetKey(math.floor(worldX / CHUNK_SIZE), math.floor(worldZ / CHUNK_SIZE))
+	local deadline = os.clock() + timeout
+
+	while os.clock() < deadline do
+		if player.Parent ~= Players then
+			return false
+		end
+
+		local built = ClientBuilt[player.UserId]
+
+		if built and built[key] then
+			return true
+		end
+
+		task.wait(0.1)
+	end
+
+	return false
+end
+
+--------------------------------------------------
+-- Player Position Save
+--------------------------------------------------
+
+local PositionStore = DataStoreService:GetDataStore("PlayerPosition_V1")
+
+local POSITION_AUTOSAVE_INTERVAL = 180
+local MIN_PLAYER_Y = -50
+
+local DeathResetting = {}
+local SavedPlayerPositions = {}
+local PositionLoaded = {}
+local PositionLoadOk = {}
+local SavingPlayers = {}
+local RestoringPlayers = {}
+local resettingPlayers = {}
+
+local function LoadPlayerPosition(player)
+	local userId = player.UserId
+	local loadedOk = false
+
+	for attempt = 1, 3 do
+		local success, data = pcall(function()
+			return PositionStore:GetAsync(tostring(userId))
+		end)
+
+		if success then
+			loadedOk = true
+
+			if type(data) == "table"
+				and type(data.X) == "number"
+				and type(data.Y) == "number"
+				and type(data.Z) == "number"
+				and data.Y >= MIN_PLAYER_Y then
+				SavedPlayerPositions[userId] = data
+			else
+				SavedPlayerPositions[userId] = nil
+			end
+
+			break
+		end
+
+		warn("Load Position Failed:", player.Name, attempt, data)
+
+		if player.Parent ~= Players then
+			return
+		end
+
+		if attempt < 3 then
+			task.wait(attempt * 2)
+		end
+	end
+
+	if player.Parent ~= Players then
+		return
+	end
+
+	PositionLoadOk[userId] = loadedOk
+	PositionLoaded[userId] = true
+end
+
+local function SavePlayerPosition(player)
+	local userId = player.UserId
+
+	if DeathResetting[userId] or resettingPlayers[userId] or RestoringPlayers[userId] then
+		return false
+	end
+
+	while SavingPlayers[userId] do
+		task.wait(0.05)
+	end
+
+	if DeathResetting[userId] or not PositionLoadOk[userId] then
+		return false
+	end
+
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+
+	if not root
+		or not root:IsA("BasePart")
+		or root.Anchored
+		or root.Position.Y < MIN_PLAYER_Y
+		or RestoringPlayers[userId]
+		or resettingPlayers[userId] then
+		return false
+	end
+
+	SavingPlayers[userId] = true
+
+	local position = root.Position
+	local _, yaw, _ = root.CFrame:ToOrientation()
+
+	local data = { X = position.X, Y = position.Y, Z = position.Z, Yaw = yaw }
+
+	local success, err = pcall(function()
+		PositionStore:SetAsync(tostring(userId), data)
+	end)
+
+	if success then
+		SavedPlayerPositions[userId] = data
+	else
+		warn("[Position] Save Failed:", player.Name, err)
+	end
+
+	SavingPlayers[userId] = nil
+
+	return success
+end
+
+local function ResetPositionOnDeath(player)
+	local userId = player.UserId
+
+	if DeathResetting[userId] then
+		return
+	end
+
+	DeathResetting[userId] = true
+
+	-- ล้างในหน่วยความจำทันที กันตัวละครใหม่ไปอ่านตำแหน่งเก่า
+	SavedPlayerPositions[userId] = nil
+
+	while SavingPlayers[userId] do
+		task.wait(0.05)
+	end
+
+	local success, err = pcall(function()
+		PositionStore:RemoveAsync(tostring(userId))
+	end)
+
+	if not success then
+		warn("[Position] Death Reset Failed:", player.Name, err)
+	end
+
+	-- สำคัญ: ต้องเป็น true เพื่อให้ตัวละครที่เกิดใหม่ไม่ค้างรอการโหลดตลอดไป
+	PositionLoaded[userId] = true
+	DeathResetting[userId] = nil
+end
+
+--------------------------------------------------
+-- Restore Character
+--------------------------------------------------
+
+local restoringCharacters = setmetatable({}, { __mode = "k" })
+
+local function RestorePlayerCharacter(player, character)
+	local userId = player.UserId
+
+	if restoringCharacters[character] then
+		return
+	end
+
+	restoringCharacters[character] = true
+	RestoringPlayers[userId] = character
+
+	local function stillValid()
+		return player.Parent == Players and player.Character == character
+	end
+
+	local function finish()
+		if RestoringPlayers[userId] == character then
+			RestoringPlayers[userId] = nil
+		end
+	end
+
+	local root = character:WaitForChild("HumanoidRootPart", 10)
+
+	if not root or not stillValid() then
+		finish()
+		return
+	end
+
+	root.Anchored = true
+
+	local waitDeadline = os.clock() + 30
+
+	while not PositionLoaded[userId] and os.clock() < waitDeadline do
+		if not stillValid() then
+			finish()
+			return
+		end
+
+		task.wait(0.1)
+	end
+
+	if not stillValid() then
+		finish()
+		return
+	end
+
+	local data = SavedPlayerPositions[userId]
+	local yaw = (data and typeof(data.Yaw) == "number") and data.Yaw or 0
+	local targetX, targetZ
+
+	if data then
+		targetX, targetZ = data.X, data.Z
+
+		character:PivotTo(
+			CFrame.new(data.X, data.Y + 3, data.Z) * CFrame.Angles(0, yaw, 0)
+		)
+	else
+		targetX, targetZ = root.Position.X, root.Position.Z
+	end
+
+	-- 1) รอ Server คำนวณ Chunk นั้นเสร็จ
+	local success, ready = pcall(function()
+		return WaitForTerrainChunk:Invoke(targetX, targetZ)
+	end)
+
+	if not success or not ready then
+		warn("Terrain ยังไม่พร้อม:", player.Name, ready)
+	end
+
+	-- 2) รอ Client สร้าง Terrain ใต้เท้าเสร็จ (กันตกทะลุ)
+	if stillValid() then
+		if not WaitForClientTerrain(player, targetX, targetZ, CLIENT_READY_TIMEOUT) then
+			warn("Client Terrain ยังไม่ยืนยัน:", player.Name)
+		end
+	end
+
+	if stillValid() and root.Parent then
+		local chunkX = math.floor(targetX / CHUNK_SIZE)
+		local chunkZ = math.floor(targetZ / CHUNK_SIZE)
+
+		if not IsSafeZoneChunk(chunkX, chunkZ) then
+			local groundY = SampleSurface(targetX, targetZ)
+
+			if root.Position.Y < groundY + 2 then
+				character:PivotTo(
+					character:GetPivot() + Vector3.new(0, groundY + 5 - root.Position.Y, 0)
+				)
+			end
+		end
+
+		root.Anchored = false
+	end
+
+	finish()
+end
+
+--------------------------------------------------
+-- Fall check
+--------------------------------------------------
+
+local function RecoverFallenPlayer(player, character, root)
+	local userId = player.UserId
+
+	if resettingPlayers[userId] then
+		return
+	end
+
+	resettingPlayers[userId] = true
+
+	local data = SavedPlayerPositions[userId]
+
+	if data
+		and typeof(data.X) == "number"
+		and typeof(data.Y) == "number"
+		and typeof(data.Z) == "number" then
+
+		local yaw = typeof(data.Yaw) == "number" and data.Yaw or 0
+
+		character:PivotTo(
+			CFrame.new(data.X, data.Y + 3, data.Z) * CFrame.Angles(0, yaw, 0)
+		)
+
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	else
+		player:LoadCharacter()
+	end
+
+	task.wait(1)
+	resettingPlayers[userId] = nil
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.5)
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			local character = player.Character
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+
+			if root
+				and not root.Anchored
+				and root.Position.Y < MIN_PLAYER_Y
+				and not resettingPlayers[player.UserId] then
+				task.spawn(RecoverFallenPlayer, player, character, root)
+			end
+		end
+	end
+end)
+
+--------------------------------------------------
+-- Admin commands
+--  !r position / !r all / !r terrain
+--------------------------------------------------
+
+local ADMIN_USER_ID = 167040872
+local TerrainResetRunning = false
+
+local function ResetPlayerPositionData(player)
+	local userId = player.UserId
+
+	if SavingPlayers[userId] then
+		warn("Reset cancelled: player is currently saving.")
+		return false
+	end
+
+	SavingPlayers[userId] = true
+
+	local success, err = pcall(function()
+		PositionStore:RemoveAsync(tostring(userId))
+	end)
+
+	SavingPlayers[userId] = nil
+
+	if not success then
+		warn("Reset Position Failed:", err)
+		return false
+	end
+
+	SavedPlayerPositions[userId] = nil
+	PositionLoaded[userId] = true
+	PositionLoadOk[userId] = true
+
+	return true
+end
+
+local function ResetTerrainWorld(player)
+	if player.UserId ~= ADMIN_USER_ID then
+		return
+	end
+
+	if TerrainResetRunning then
+		warn("[RESET] Reset is already running.")
+		return
+	end
+
+	TerrainResetRunning = true
+	IsCleaningTerrain = true
+
+	-- รอ Chunk ที่กำลังสร้างให้จบ
+	while true do
+		local busy = false
+
+		for _, state in pairs(LoadedChunks) do
+			if state == "Loading" then
+				busy = true
+				break
+			end
+		end
+
+		if not busy then
+			break
+		end
+
+		task.wait(0.2)
+	end
+
+	GeneratedProps:ClearAllChildren()
+	PlacedItemsFolder:ClearAllChildren()
+	WorkspaceFolder:ClearAllChildren()
+
+	table.clear(ChunkMobs)
+	table.clear(MobPending)
+	table.clear(LoadedChunks)
+	table.clear(ChunkCache)
+	table.clear(ChunkFailedUntil)
+	table.clear(DesiredChunks)
+	table.clear(ChunkQueue)
+	table.clear(TerrainPayloadCache)
+	table.clear(SentChunks)
+	table.clear(ClientBuilt)
+	table.clear(LastTerrainRequest)
+
+	QueueHead = 1
+	QueueTail = 0
+
+	table.clear(ExploredChunks)
+	table.clear(LastMapRequest)
+	table.clear(LastPlayerChunk)
+	table.clear(PlayerExploredChunks)
+
+	SEED = Random.new():NextInteger(1, 100000)
+
+	-- สั่งให้ทุก Client ล้าง Terrain ของตัวเอง
+	ResetTerrainEvent:FireAllClients()
+
+	print("[RESET] New SEED:", SEED)
+
+	IsCleaningTerrain = false
+	TerrainResetRunning = false
+end
+
+local function ConnectAdminCommands(player)
+	if player.UserId ~= ADMIN_USER_ID then
+		return
+	end
+
+	player.Chatted:Connect(function(message)
+		local command = string.lower(message)
+		command = string.gsub(command, "^%s*(.-)%s*$", "%1")
+
+		if command == "!r position" then
+			ResetPlayerPositionData(player)
+
+		elseif command == "!r all" then
+			if ResetPlayerPositionData(player) then
+				player:LoadCharacter()
+			end
+
+		elseif command == "!r terrain" then
+			task.spawn(ResetTerrainWorld, player)
+		end
+	end)
+end
+
+Players.PlayerAdded:Connect(ConnectAdminCommands)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	ConnectAdminCommands(player)
+end
+
+--------------------------------------------------
+-- Player setup / teardown
+--------------------------------------------------
+
+local function SetupPositionSave(player)
+	player.CharacterAdded:Connect(function(character)
+		task.spawn(RestorePlayerCharacter, player, character)
+
+		local humanoid = character:WaitForChild("Humanoid", 10)
+
+		if humanoid then
+			humanoid.Died:Connect(function()
+				task.spawn(ResetPositionOnDeath, player)
+			end)
+		end
+	end)
+
+	task.spawn(function()
+		LoadPlayerPosition(player)
+
+		if player.Character then
+			task.spawn(RestorePlayerCharacter, player, player.Character)
+		end
+	end)
+end
+
+Players.PlayerAdded:Connect(SetupPositionSave)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(SetupPositionSave, player)
+end
+
+task.spawn(function()
+	while true do
+		task.wait(POSITION_AUTOSAVE_INTERVAL)
+
+		local list = Players:GetPlayers()
+		local gap = math.min(1, POSITION_AUTOSAVE_INTERVAL * 0.5 / math.max(#list, 1))
+
+		for _, player in ipairs(list) do
+			if player.Parent == Players then
+				task.spawn(SavePlayerPosition, player)
+			end
+
+			task.wait(gap)
+		end
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	local userId = player.UserId
+
+	if not DeathResetting[userId] then
+		SavePlayerPosition(player)
+	end
+
+	SavedPlayerPositions[userId] = nil
+	PositionLoaded[userId] = nil
+	PositionLoadOk[userId] = nil
+	SavingPlayers[userId] = nil
+	RestoringPlayers[userId] = nil
+	resettingPlayers[userId] = nil
+
+	LastPlayerChunk[userId] = nil
+	PlayerExploredChunks[userId] = nil
+	LastMapRequest[userId] = nil
+	LastPositionRequest[userId] = nil
+	LastTerrainRequest[userId] = nil
+
+	SentChunks[userId] = nil
+	ClientBuilt[userId] = nil
+end)
+
+game:BindToClose(function()
+	local pending = 0
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		pending += 1
+
+		task.spawn(function()
+			SavePlayerPosition(player)
+			pending -= 1
+		end)
+	end
+
+	local deadline = os.clock() + 25
+
+	while pending > 0 and os.clock() < deadline do
+		task.wait(0.1)
+	end
+end)
+
+--------------------------------------------------
+-- Debug monitor
+--------------------------------------------------
+
+task.spawn(function()
+	while true do
+		task.wait(10)
+
+		if not DEBUG then
+			continue
+		end
+
+		local loaded, loading, queued, cached = 0, 0, 0, 0
+
+		for _, state in pairs(LoadedChunks) do
+			if state == true then
+				loaded += 1
+			elseif state == "Loading" then
+				loading += 1
+			elseif state == "Queued" then
+				queued += 1
+			end
+		end
+
+		for _ in pairs(ChunkCache) do
+			cached += 1
+		end
+
+		print(
+			"[Chunk Monitor]",
+			"Loaded:", loaded,
+			"Loading:", loading,
+			"Queued:", queued,
+			"Cached:", cached,
+			"Queue Pending:", math.max(0, QueueTail - QueueHead + 1),
+			"Players:", #Players:GetPlayers()
+		)
+	end
+end)
+
+--------------------------------------------------
+-- Main Loop
+--------------------------------------------------
+
+local function UpdateWorld()
+	table.clear(DesiredChunks)
+
+	local players = Players:GetPlayers()
+	local settings = GetCrowdSettings(#players)
+	local playerChunks = {}
+
+	local function Want(cx, cz, px, pz)
+		local key = GetKey(cx, cz)
+		local dx = cx - px
+		local dz = cz - pz
+		local d = dx * dx + dz * dz
+
+		local entry = DesiredChunks[key]
+
+		if entry then
+			if d < entry.P then
+				entry.P = d
+			end
+		else
+			DesiredChunks[key] = { X = cx, Z = cz, P = d }
+		end
+	end
+
+	for _, player in ipairs(players) do
+		local chunkX, chunkZ = GetPlayerChunk(player)
+
+		if chunkX then
+			table.insert(playerChunks, { chunkX, chunkZ })
+
+			local playerChunkKey = GetKey(chunkX, chunkZ)
+
+			if LastPlayerChunk[player.UserId] ~= playerChunkKey then
+				LastPlayerChunk[player.UserId] = playerChunkKey
+
+				PlayerExploredChunks[player.UserId] = PlayerExploredChunks[player.UserId] or {}
+				PlayerExploredChunks[player.UserId][playerChunkKey] = GetBiome(chunkX, chunkZ)
+
+				MarkChunkExplored(chunkX, chunkZ)
+			end
+
+			local root = player.Character
+				and player.Character:FindFirstChild("HumanoidRootPart")
+
+			local velocity = root and root.AssemblyLinearVelocity or Vector3.zero
+			local speed = velocity.Magnitude
+
+			local extraRadius = 0
+
+			if speed >= 60 then
+				extraRadius = 2
+			elseif speed >= 30 then
+				extraRadius = 1
+			end
+
+			extraRadius = math.min(extraRadius, settings.MaxExtra)
+
+			local radius = settings.Radius + extraRadius
+
+			local direction = Vector3.zero
+			local flat = Vector3.new(velocity.X, 0, velocity.Z)
+
+			if speed > 5 and flat.Magnitude > 1 then
+				direction = flat.Unit
+			end
+
+			local lookAhead = math.min(
+				math.clamp(math.floor(speed / 25), 0, 5),
+				settings.MaxLookAhead
+			)
+
+			for x = -radius, radius do
+				for z = -radius, radius do
+					Want(chunkX + x, chunkZ + z, chunkX, chunkZ)
+				end
+			end
+
+			if lookAhead > 0 and direction.Magnitude > 0 then
+				for step = 1, lookAhead do
+					local cx = math.floor(
+						(root.Position.X + direction.X * CHUNK_SIZE * step) / CHUNK_SIZE
+					)
+
+					local cz = math.floor(
+						(root.Position.Z + direction.Z * CHUNK_SIZE * step) / CHUNK_SIZE
+					)
+
+					for ox = -1, 1 do
+						for oz = -1, 1 do
+							Want(cx + ox, cz + oz, chunkX, chunkZ)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- Generate Missing Chunks
+	local now = os.clock()
+
+	for key, chunk in pairs(DesiredChunks) do
+		if not LoadedChunks[key] and (ChunkFailedUntil[key] or 0) <= now then
+			LoadedChunks[key] = "Queued"
+			QueueTail += 1
+
+			ChunkQueue[QueueTail] = { Key = key, X = chunk.X, Z = chunk.Z }
+		end
+	end
+
+	-- Unload Distant Chunks
+	local unloaded = 0
+	local unloadRadius = settings.Unload
+
+	for key, state in pairs(LoadedChunks) do
+		if state == true and not DesiredChunks[key] then
+			local chunkX, chunkZ = string.match(key, "^(-?%d+)_(-?%d+)$")
+			chunkX, chunkZ = tonumber(chunkX), tonumber(chunkZ)
+
+			if chunkX and chunkZ then
+				local shouldUnload = true
+
+				for _, pc in ipairs(playerChunks) do
+					if math.abs(pc[1] - chunkX) <= unloadRadius
+						and math.abs(pc[2] - chunkZ) <= unloadRadius then
+						shouldUnload = false
+						break
+					end
+				end
+
+				if shouldUnload and not IsSafeZoneChunk(chunkX, chunkZ) then
+					RemoveChunk(chunkX, chunkZ)
+
+					unloaded += 1
+
+					if unloaded >= MAX_UNLOADS_PER_TICK then
+						break
+					end
+				end
+			else
+				LoadedChunks[key] = nil
+			end
+		end
+	end
+
+	ProcessPendingMobs()
+end
+
+while true do
+	local ok, err = pcall(UpdateWorld)
+
+	if not ok then
+		warn("[Terrain] Main loop error:", err)
+	end
+
+	task.wait(UPDATE_INTERVAL)
+end
+
+--------------------------------------------------
+-- TerrainClient  (LocalScript)
+-- วางไว้ที่: StarterPlayer > StarterPlayerScripts
+--
+-- รับ buffer จาก Server แล้วสร้าง Voxel ในเครื่องตัวเอง
+--  * สร้างทีละ "แถบ" (8 คอลัมน์) และจำกัดเวลาต่อเฟรม -> ไม่กระตุก
+--  * ใช้ Array ซ้ำ (pool) -> ไม่สร้าง Table ใหม่ทุกครั้ง
+--  * เลือกสร้าง Chunk ที่ใกล้ตัวก่อนเสมอ
+--  * ไม่ต้อง Poll Server: Server ส่งมาให้เอง
+--------------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = require(ReplicatedStorage:WaitForChild("TerrainShared"))
+
+local Player = Players.LocalPlayer
+local Terrain = workspace.Terrain
+
+--------------------------------------------------
+-- Config
+--------------------------------------------------
+
+local CHUNK_SIZE = Shared.CHUNK_SIZE
+local RES = Shared.RES
+local COLS = CHUNK_SIZE / RES
+local COLUMN_BYTES = Shared.COLUMN_BYTES
+local HEIGHT_SCALE = Shared.HEIGHT_SCALE
+local MATERIAL_LIST = Shared.MATERIAL_LIST
+
+local UNDER_DEPTH = Shared.UNDER_DEPTH
+local ROCK_LAYER_MIN = Shared.ROCK_LAYER_MIN
+local ROCK_LAYER_MAX = Shared.ROCK_LAYER_MAX
+local ROCK_ALPHA_MIN = Shared.ROCK_ALPHA_MIN
+
+local LOAD_RADIUS = Shared.CLIENT_LOAD_RADIUS
+local UNLOAD_RADIUS = Shared.CLIENT_UNLOAD_RADIUS
+
+local STRIP_COLS = 8                -- จำนวนคอลัมน์ต่อการเขียน 1 ครั้ง
+local FRAME_BUDGET = 0.004          -- งบเวลาต่อเฟรม (4ms)
+local UPDATE_INTERVAL = 0.4
+local MAX_UNLOADS_PER_UPDATE = 2
+local RECOVER_AFTER = 3             -- ถ้ารอเกินกี่วินาทีแล้วยังไม่ได้ Chunk ให้ขอใหม่
+local RECOVER_RETRY = 4
+local MAX_POOL_SIZE = 8
+
+local AIR = Enum.Material.Air
+local WATER = Enum.Material.Water
+
+--------------------------------------------------
+-- Remotes
+--------------------------------------------------
+
+local TerrainRemotes = ReplicatedStorage:WaitForChild("TerrainRemotes")
+local RequestChunk = TerrainRemotes:WaitForChild("RequestChunk")
+local ChunkData = TerrainRemotes:WaitForChild("ChunkData")
+local ChunkBuilt = TerrainRemotes:WaitForChild("ChunkBuilt")
+local ResetTerrain = TerrainRemotes:WaitForChild("ResetTerrain")
+
+--------------------------------------------------
+-- State
+--------------------------------------------------
+
+local Loaded = {}        -- [key] = { X, Z, MinY, MaxY, Empty }
+local Queue = {}         -- [key] = payload (รอสร้าง)
+local Building = nil     -- key ที่กำลังสร้าง
+local Epoch = 0          -- เปลี่ยนทุกครั้งที่ Reset เพื่อยกเลิกงานเก่า
+
+local WantedSince = {}
+local RequestedAt = {}
+
+local CenterX, CenterZ = 0, 0
+
+local function GetKey(x, z)
+	return tostring(x) .. "_" .. tostring(z)
+end
+
+--------------------------------------------------
+-- Frame budget
+--------------------------------------------------
+
+local sliceStart = os.clock()
+
+local function Yield()
+	if os.clock() - sliceStart >= FRAME_BUDGET then
+		task.wait()
+		sliceStart = os.clock()
+	end
+end
+
+--------------------------------------------------
+-- Array pool (ใช้ซ้ำตามความสูง)
+--------------------------------------------------
+
+local ArrayPool = {}
+local PoolCount = 0
+
+local function GetArrays(sizeY)
+	local pooled = ArrayPool[sizeY]
+
+	if pooled then
+		return pooled[1], pooled[2]
+	end
+
+	if PoolCount >= MAX_POOL_SIZE then
+		table.clear(ArrayPool)
+		PoolCount = 0
+	end
+
+	local materials = table.create(STRIP_COLS)
+	local occupancy = table.create(STRIP_COLS)
+
+	for x = 1, STRIP_COLS do
+		materials[x] = table.create(sizeY)
+		occupancy[x] = table.create(sizeY)
+
+		for y = 1, sizeY do
+			materials[x][y] = table.create(COLS, AIR)
+			occupancy[x][y] = table.create(COLS, 0)
+		end
+	end
+
+	ArrayPool[sizeY] = { materials, occupancy }
+	PoolCount += 1
+
+	return materials, occupancy
+end
+
+--------------------------------------------------
+-- Build one chunk
+--------------------------------------------------
+
+local function BuildChunk(key, payload)
+	local epoch = Epoch
+	local chunkX, chunkZ = payload.X, payload.Z
+
+	-- Chunk ว่าง (Safe Zone): ไม่ต้องสร้างอะไร แค่บอกว่ารับแล้ว
+	if payload.Empty then
+		Loaded[key] = { X = chunkX, Z = chunkZ, Empty = true }
+		ChunkBuilt:FireServer(key)
+		return
+	end
+
+	local buf = payload.Data
+	local minY = payload.MinY
+	local maxY = payload.MaxY
+	local seaLevel = payload.SeaLevel
+
+	if typeof(buf) ~= "buffer"
+		or buffer.len(buf) ~= COLS * COLS * COLUMN_BYTES
+		or type(minY) ~= "number"
+		or type(maxY) ~= "number"
+		or type(seaLevel) ~= "number" then
+		warn("[Client Terrain] Invalid payload:", key)
+		return
+	end
+
+	local sizeY = math.round((maxY - minY) / RES)
+
+	if sizeY <= 0 then
+		return
+	end
+
+	local startX = chunkX * CHUNK_SIZE
+	local startZ = chunkZ * CHUNK_SIZE
+
+	local materials, occupancy = GetArrays(sizeY)
+	local stripCount = COLS / STRIP_COLS
+
+	for strip = 0, stripCount - 1 do
+		if epoch ~= Epoch then
+			return
+		end
+
+		local firstCol = strip * STRIP_COLS
+
+		for lx = 1, STRIP_COLS do
+			local cx = firstCol + lx - 1
+			local matsX = materials[lx]
+			local occX = occupancy[lx]
+
+			for z = 1, COLS do
+				local o = (cx * COLS + (z - 1)) * COLUMN_BYTES
+
+				local height = buffer.readi16(buf, o) / HEIGHT_SCALE
+				local bottom = buffer.readi16(buf, o + 2) / HEIGHT_SCALE
+				local rockAlpha = buffer.readu8(buf, o + 4) / 255
+				local isLand = buffer.readu8(buf, o + 5) == 1
+
+				local surfMat = MATERIAL_LIST[buffer.readu8(buf, o + 6)] or Enum.Material.Grass
+				local underMat = MATERIAL_LIST[buffer.readu8(buf, o + 7)] or Enum.Material.Ground
+				local cliffMat = MATERIAL_LIST[buffer.readu8(buf, o + 8)] or Enum.Material.Rock
+
+				local rockDepth = ROCK_LAYER_MIN + rockAlpha * (ROCK_LAYER_MAX - ROCK_LAYER_MIN)
+				local useCliff = isLand and rockAlpha > ROCK_ALPHA_MIN
+
+				for y = 1, sizeY do
+					local voxelBottom = minY + (y - 1) * RES
+					local material = AIR
+					local amount = 0
+
+					if voxelBottom + RES > bottom then
+						local depth = height - voxelBottom
+						local fill = depth / RES
+
+						if fill > 0 then
+							if fill > 1 then
+								fill = 1
+							end
+
+							if useCliff and depth <= rockDepth then
+								material = cliffMat
+							elseif depth > UNDER_DEPTH then
+								material = underMat
+							else
+								material = surfMat
+							end
+
+							amount = fill
+
+						elseif voxelBottom < seaLevel then
+							material = WATER
+							amount = (seaLevel - voxelBottom) / RES
+
+							if amount > 1 then
+								amount = 1
+							end
+						end
+					end
+
+					matsX[y][z] = material
+					occX[y][z] = amount
+				end
+			end
+
+			if lx % 2 == 0 then
+				Yield()
+			end
+		end
+
+		if epoch ~= Epoch then
+			return
+		end
+
+		local region = Region3.new(
+			Vector3.new(startX + firstCol * RES, minY, startZ),
+			Vector3.new(
+				startX + (firstCol + STRIP_COLS) * RES,
+				minY + sizeY * RES,
+				startZ + CHUNK_SIZE
+			)
+		)
+
+		local ok, err = pcall(function()
+			Terrain:WriteVoxels(region, RES, materials, occupancy)
+		end)
+
+		if not ok then
+			warn("[Client Terrain] WriteVoxels failed:", key, err)
+			return
+		end
+
+		Yield()
+	end
+
+	if epoch ~= Epoch then
+		return
+	end
+
+	Loaded[key] = { X = chunkX, Z = chunkZ, MinY = minY, MaxY = maxY }
+	RequestedAt[key] = nil
+	WantedSince[key] = nil
+
+	ChunkBuilt:FireServer(key)
+end
+
+--------------------------------------------------
+-- Unload
+--------------------------------------------------
+
+local function UnloadChunk(key, info)
+	if not info.Empty then
+		Terrain:FillBlock(
+			CFrame.new(
+				info.X * CHUNK_SIZE + CHUNK_SIZE / 2,
+				(info.MinY + info.MaxY) / 2,
+				info.Z * CHUNK_SIZE + CHUNK_SIZE / 2
+			),
+			Vector3.new(CHUNK_SIZE, info.MaxY - info.MinY, CHUNK_SIZE),
+			AIR
+		)
+	end
+
+	Loaded[key] = nil
+	RequestedAt[key] = nil
+end
+
+--------------------------------------------------
+-- Receive
+--------------------------------------------------
+
+ChunkData.OnClientEvent:Connect(function(payload)
+	if type(payload) ~= "table"
+		or type(payload.X) ~= "number"
+		or type(payload.Z) ~= "number" then
+		return
+	end
+
+	local key = GetKey(payload.X, payload.Z)
+
+	if Loaded[key] then
+		-- มีอยู่แล้ว (เช่น Server ส่งซ้ำตอนขอใหม่) แค่ยืนยันกลับ
+		ChunkBuilt:FireServer(key)
+		return
+	end
+
+	if Queue[key] or Building == key then
+		return
+	end
+
+	Queue[key] = payload
+end)
+
+ResetTerrain.OnClientEvent:Connect(function()
+	Epoch += 1
+
+	table.clear(Queue)
+	table.clear(Loaded)
+	table.clear(WantedSince)
+	table.clear(RequestedAt)
+
+	Terrain:Clear()
+end)
+
+--------------------------------------------------
+-- Builder thread: เลือก Chunk ที่ใกล้ที่สุดก่อนเสมอ
+--------------------------------------------------
+
+local function PickNext()
+	local bestKey, bestPayload
+	local bestDistance = math.huge
+
+	for key, payload in pairs(Queue) do
+		local dx = payload.X - CenterX
+		local dz = payload.Z - CenterZ
+
+		-- ไกลเกินระยะที่จะเก็บไว้: ทิ้ง
+		if math.max(math.abs(dx), math.abs(dz)) > UNLOAD_RADIUS then
+			Queue[key] = nil
+		else
+			local distance = dx * dx + dz * dz
+
+			if distance < bestDistance then
+				bestDistance = distance
+				bestKey = key
+				bestPayload = payload
+			end
+		end
+	end
+
+	if bestKey then
+		Queue[bestKey] = nil
+	end
+
+	return bestKey, bestPayload
+end
+
+task.spawn(function()
+	while true do
+		local key, payload = PickNext()
+
+		if not key then
+			task.wait(0.05)
+		else
+			Building = key
+			sliceStart = os.clock()
+
+			local ok, err = pcall(BuildChunk, key, payload)
+
+			if not ok then
+				warn("[Client Terrain] Error:", key, err)
+			end
+
+			Building = nil
+		end
+	end
+end)
+
+--------------------------------------------------
+-- Update loop: ลบ Chunk ไกล + ขอ Chunk ที่หายไป
+--------------------------------------------------
+
+task.spawn(function()
+	while true do
+		task.wait(UPDATE_INTERVAL)
+
+		local character = Player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+
+		if not root then
+			continue
+		end
+
+		CenterX = math.floor(root.Position.X / CHUNK_SIZE)
+		CenterZ = math.floor(root.Position.Z / CHUNK_SIZE)
+
+		-- Unload
+		local unloaded = 0
+
+		for key, info in pairs(Loaded) do
+			if math.max(math.abs(info.X - CenterX), math.abs(info.Z - CenterZ)) > UNLOAD_RADIUS then
+				UnloadChunk(key, info)
+
+				unloaded += 1
+
+				if unloaded >= MAX_UNLOADS_PER_UPDATE then
+					break
+				end
+			end
+		end
+
+		-- Recovery: Chunk ในรัศมีที่ควรมี แต่ยังไม่มา
+		local now = os.clock()
+		local stillMissing = {}
+		local requested = false
+		local limit = LOAD_RADIUS * LOAD_RADIUS + 1
+
+		for dx = -LOAD_RADIUS, LOAD_RADIUS do
+			for dz = -LOAD_RADIUS, LOAD_RADIUS do
+				if dx * dx + dz * dz <= limit then
+					local x, z = CenterX + dx, CenterZ + dz
+					local key = GetKey(x, z)
+
+					if not Loaded[key] and not Queue[key] and Building ~= key then
+						local since = WantedSince[key] or now
+						stillMissing[key] = since
+
+						if not requested
+							and now - since >= RECOVER_AFTER
+							and (not RequestedAt[key] or now - RequestedAt[key] >= RECOVER_RETRY) then
+
+							RequestedAt[key] = now
+							requested = true
+
+							RequestChunk:FireServer(x, z)
+						end
+					end
+				end
+			end
+		end
+
+		WantedSince = stillMissing
+	end
+end)
+
+--------------------------------------------------
+-- Water Settings (Local)
+--------------------------------------------------
+
+Terrain.WaterColor = Color3.fromRGB(40, 120, 160)
+Terrain.WaterTransparency = 0.75
+Terrain.WaterReflectance = 0.6
+Terrain.WaterWaveSize = 0.15
+Terrain.WaterWaveSpeed = 8
+
+--------------------------------------------------
+-- TerrainShared  (ModuleScript)
+-- วางไว้ที่: ReplicatedStorage > TerrainShared
+-- ค่าที่ Server และ Client ต้องตรงกันเสมอ
+--------------------------------------------------
+
+local Shared = {}
+
+Shared.CHUNK_SIZE = 128
+Shared.RES = 4
+
+-- รัศมีที่ Client โหลด Terrain (หน่วย Chunk) / ระยะที่ Client ลบ (Chebyshev)
+Shared.CLIENT_LOAD_RADIUS = 2
+Shared.CLIENT_UNLOAD_RADIUS = 4
+
+-- รูปแบบข้อมูลใน buffer ต่อ 1 คอลัมน์ (9 ไบต์)
+--  0: int16  ความสูง * HEIGHT_SCALE
+--  2: int16  ก้นของ Terrain * HEIGHT_SCALE
+--  4: uint8  rockAlpha * 255
+--  5: uint8  เป็นพื้นดินหรือไม่ (0/1)
+--  6: uint8  วัสดุผิว (index ใน MATERIAL_LIST)
+--  7: uint8  วัสดุใต้ผิว
+--  8: uint8  วัสดุหน้าผา
+Shared.COLUMN_BYTES = 9
+Shared.HEIGHT_SCALE = 16
+
+-- พารามิเตอร์การเลือกวัสดุตามความลึก (ฝั่ง Client ใช้ตอนสร้าง Voxel)
+Shared.UNDER_DEPTH = 5
+Shared.ROCK_LAYER_MIN = 6
+Shared.ROCK_LAYER_MAX = 16
+Shared.ROCK_ALPHA_MIN = 0.12
+
+local Mat = Enum.Material
+
+Shared.MATERIAL_LIST = {
+	Mat.Air,        -- 1
+	Mat.Water,      -- 2
+	Mat.Grass,      -- 3
+	Mat.LeafyGrass, -- 4
+	Mat.Ground,     -- 5
+	Mat.Rock,       -- 6
+	Mat.Slate,      -- 7
+	Mat.Basalt,     -- 8
+	Mat.Sand,       -- 9
+	Mat.Sandstone,  -- 10
+	Mat.Mud,        -- 11
+	Mat.Snow,       -- 12
+}
+
+Shared.MATERIAL_INDEX = {}
+
+for index, material in ipairs(Shared.MATERIAL_LIST) do
+	Shared.MATERIAL_INDEX[material] = index
+end
+
+return Shared
+
+
+local MobManager = {}
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local MobFolder = ReplicatedStorage:WaitForChild("Mob")
+local AIFolder = script.Parent:WaitForChild("AI")
+
+--------------------------------------------------
+-- AI MODULES
+--------------------------------------------------
+
+local AILevels = {
+	Simple = require(AIFolder:WaitForChild("SimpleAI")),
+	Predator = require(AIFolder:WaitForChild("PredatorSimple")),
+}
+
+--------------------------------------------------
+-- MOB FOLDER
+--------------------------------------------------
+
+local WorkspaceFolder = workspace:FindFirstChild("Mobs")
+
+if not WorkspaceFolder then
+	WorkspaceFolder = Instance.new("Folder")
+	WorkspaceFolder.Name = "Mobs"
+	WorkspaceFolder.Parent = workspace
+end
+
+local ActiveMobs = {}
+
+--------------------------------------------------
+-- START / SPAWN
+--------------------------------------------------
+
+function MobManager.Start(Amount, MobName, SpawnCFrame, Difficulty)
+
+	Amount = math.max(1, math.floor(tonumber(Amount) or 1))
+	Difficulty = Difficulty or "Small"
+
+	local Template = MobFolder:FindFirstChild(MobName)
+
+	if not Template or not Template:IsA("Model") then
+		warn("[MobManager] Mob not found:", MobName)
+		return {}
+	end
+
+	-- อ่าน AI จาก Attribute ของ Model
+	local AIType = Template:GetAttribute("AILevel") or "Simple"
+	local AI = AILevels[AIType]
+
+	if not AI then
+		warn("[MobManager] Unknown AI:", AIType)
+		return {}
+	end
+
+	-- ส่วนโค้ด Spawn เดิมของคุณให้ทำงานต่อจากตรงนี้
+
+	SpawnCFrame = SpawnCFrame or CFrame.new(0, 5, 0)
+
+	if typeof(SpawnCFrame) == "Vector3" then
+		SpawnCFrame = CFrame.new(SpawnCFrame)
+	end
+
+	if typeof(SpawnCFrame) ~= "CFrame" then
+		warn("[MobManager] Invalid SpawnCFrame")
+		return {}
+	end
+
+	local Spawned = {}
+
+	for Index = 1, Amount do
+
+		local Mob = Template:Clone()
+
+		local Humanoid = Mob:FindFirstChildOfClass("Humanoid")
+
+		if not Humanoid then
+			warn("[MobManager] Missing Humanoid:", MobName)
+			Mob:Destroy()
+			continue
+		end
+
+		local Angle = (Index - 1) * 2.399
+		local Distance = math.sqrt(Index - 1) * 3
+
+		local Offset = Vector3.new(
+			math.cos(Angle) * Distance,
+			0,
+			math.sin(Angle) * Distance
+		)
+
+		Mob:PivotTo(SpawnCFrame + Offset)
+		Mob.Parent = WorkspaceFolder
+
+		ActiveMobs[Mob] = true
+
+		task.spawn(function()
+
+			local Success, Error = pcall(function()
+				AI.Start(Mob, Difficulty)
+			end)
+
+			if not Success then
+				warn("[MobManager] AI Error:", Error)
+			end
+
+			ActiveMobs[Mob] = nil
+
+		end)
+
+		table.insert(Spawned, Mob)
+
+	end
+
+	return Spawned
+end
+
+--------------------------------------------------
+-- REMOVE
+--------------------------------------------------
+
+function MobManager.Remove(Mob)
+
+	if not Mob then
+		return
+	end
+
+	ActiveMobs[Mob] = nil
+
+	if Mob.Parent then
+		Mob:Destroy()
+	end
+
+end
+
+--------------------------------------------------
+-- GET ACTIVE
+--------------------------------------------------
+
+function MobManager.GetActive()
+
+	local Result = {}
+
+	for Mob in pairs(ActiveMobs) do
+
+		if Mob.Parent then
+			table.insert(Result, Mob)
+		else
+			ActiveMobs[Mob] = nil
+		end
+
+	end
+
+	return Result
+end
+
+return MobManager
+
+
+--[[
+================================================================
+                        MOB MANAGER
+                    DOCUMENTATION / README
+================================================================
+
+ระบบจัดการ NPC (Mob) สำหรับ Roblox
+
+ความสามารถ:
+- Spawn Mob หลายตัวพร้อมกัน
+- เลือก AI อัตโนมัติจาก Attribute ของ Model
+- รองรับ AI หลายประเภท
+- กำหนด Difficulty ให้ Mob
+- รองรับตำแหน่ง Spawn แบบ Vector3 และ CFrame
+- จัดเก็บ Mob ที่กำลังทำงานอยู่
+- ลบ Mob ผ่าน MobManager
+- เรียกดู Mob ที่กำลังทำงานอยู่ทั้งหมด
+
+
+================================================================
+1. FOLDER STRUCTURE
+================================================================
+
+ReplicatedStorage
+└── Mob
+    ├── Zombie (Model)
+    ├── Pig (Model)
+    └── Skeleton (Model)
+
+ServerScriptService
+└── MobSystem
+    ├── MobManager (ModuleScript)
+    │
+    └── AI
+        ├── SimpleAI (ModuleScript)
+        ├── PredatorSimple (ModuleScript)
+        └── ...
+
+
+================================================================
+2. MOB MODEL REQUIREMENTS
+================================================================
+
+Mob ทุกตัวต้องอยู่ใน:
+
+ReplicatedStorage > Mob
+
+องค์ประกอบพื้นฐานที่ต้องมี:
+
+Zombie (Model)
+├── Humanoid
+├── HumanoidRootPart
+├── Head
+└── Body Parts
+
+ข้อกำหนด:
+- ต้องเป็น Model
+- ต้องมี Humanoid
+- ต้องมี HumanoidRootPart
+- HumanoidRootPart ต้อง Anchored = false
+- ชิ้นส่วนร่างกายต้องเชื่อมต่อกันอย่างถูกต้อง
+- Model ต้องสามารถเคลื่อนไหวด้วย Humanoid ได้
+
+หมายเหตุ:
+PrimaryPart ไม่จำเป็นสำหรับระบบ Spawn นี้
+เพราะใช้ Model:PivotTo() ในการกำหนดตำแหน่ง
+
+
+================================================================
+3. ANIMATION REQUIREMENTS
+================================================================
+
+Animation ไม่จำเป็นสำหรับการ Spawn Mob
+
+แต่หาก AI Module มีระบบเล่น Animation
+ต้องเตรียม Animation ให้ตรงกับที่ AI เรียกใช้ เช่น:
+
+- Idle
+- Walk
+- Run
+- Attack
+- Death
+
+หาก AI ไม่ได้เรียกใช้ Animation ก็ไม่จำเป็นต้องใส่
+
+
+================================================================
+4. AI ATTRIBUTE
+================================================================
+
+MobManager จะอ่าน Attribute จาก Model
+เพื่อเลือก AI ที่จะใช้โดยอัตโนมัติ
+
+ชื่อ Attribute:
+
+AILevel (String)
+
+ตัวอย่าง:
+
+Zombie:
+    AILevel = "Predator"
+
+Pig:
+    AILevel = "Simple"
+
+หากไม่ได้กำหนด AILevel:
+ระบบจะเลือก Simple เป็นค่าเริ่มต้น
+
+local AIType = Template:GetAttribute("AILevel") or "Simple"
+
+
+================================================================
+5. AI MODULE REGISTRATION
+================================================================
+
+AI ต้องลงทะเบียนไว้ในตาราง AILevels
+
+ตัวอย่าง:
+
+local AILevels = {
+    Simple = require(AIFolder:WaitForChild("SimpleAI")),
+    Predator = require(AIFolder:WaitForChild("PredatorSimple")),
+}
+
+ชื่อ Key ต้องตรงกับค่า AILevel ของ Model
+
+ตัวอย่าง:
+AILevel = "Predator"
+ต้องมี Key ชื่อ Predator ใน AILevels
+
+หากไม่มี AI ที่ตรงกัน ระบบจะไม่ Spawn Mob
+
+
+================================================================
+6. AI MODULE REQUIREMENTS
+================================================================
+
+AI Module ต้องมีฟังก์ชัน:
+
+AI.Start(Mob, Difficulty)
+
+ตัวอย่างรูปแบบ:
+
+local SimpleAI = {}
+
+function SimpleAI.Start(Mob, Difficulty)
+
+    -- เริ่มระบบ AI ของ Mob
+
+end
+
+return SimpleAI
+
+MobManager จะเรียก AI.Start() แยก Thread
+เพื่อไม่ให้การ Spawn Mob ต้องรอ AI ทำงานเสร็จ
+
+AI Module ควรจัดการ Lifecycle ของตัวเอง
+เช่น การหยุดทำงานเมื่อ Mob ถูก Destroy
+
+
+================================================================
+7. SPAWN MOB
+================================================================
+
+รูปแบบคำสั่ง:
+
+MobManager.Start(
+    Amount,
+    MobName,
+    SpawnCFrame,
+    Difficulty
+)
+
+PARAMETERS:
+
+Amount:
+    จำนวน Mob ที่ต้องการ Spawn
+    Type: Number
+
+MobName:
+    ชื่อ Model ภายใน ReplicatedStorage/Mob
+    Type: String
+
+SpawnCFrame:
+    ตำแหน่ง Spawn
+    Type: Vector3 หรือ CFrame
+
+Difficulty:
+    ระดับความยาก
+    Type: String
+
+    หากไม่กำหนดจะใช้ "Small"
+
+
+================================================================
+8. SPAWN EXAMPLES
+================================================================
+
+ตัวอย่างการเรียกใช้ MobManager:
+
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local MobManager = require(
+    ServerScriptService
+        :WaitForChild("MobSystem")
+        :WaitForChild("MobManager")
+)
+
+
+-- Spawn Zombie จำนวน 3 ตัว
+
+MobManager.Start(
+    3,
+    "Zombie",
+    Vector3.new(89.7, 40.5, -18.4),
+    "Medium"
+)
+
+
+-- Spawn Pig จำนวน 5 ตัว
+
+MobManager.Start(
+    5,
+    "Pig",
+    Vector3.new(0, 10, 0),
+    "Small"
+)
+
+
+-- Spawn ด้วย CFrame
+
+MobManager.Start(
+    3,
+    "Zombie",
+    CFrame.new(0, 10, 0),
+    "Hard"
+)
+
+
+-- ไม่กำหนดตำแหน่ง
+
+MobManager.Start(
+    2,
+    "Pig"
+)
+
+ตำแหน่งเริ่มต้นจะเป็น CFrame.new(0, 5, 0)
+
+
+================================================================
+9. SPAWN POSITION OFFSET
+================================================================
+
+เมื่อ Spawn Mob หลายตัวพร้อมกัน
+ระบบจะกระจายตำแหน่งของ Mob โดยอัตโนมัติ
+
+ใช้สูตร:
+
+local Angle = (Index - 1) * 2.399
+local Distance = math.sqrt(Index - 1) * 3
+
+ช่วยลดปัญหา Mob เกิดทับตำแหน่งเดียวกัน
+
+ระยะห่างจะเพิ่มขึ้นตามจำนวน Mob ที่ Spawn
+
+
+================================================================
+10. REMOVE MOB
+================================================================
+
+ใช้สำหรับลบ Mob ที่ต้องการ
+
+รูปแบบ:
+
+MobManager.Remove(Mob)
+
+ตัวอย่าง:
+
+local SpawnedMobs = MobManager.Start(
+    3,
+    "Zombie",
+    Vector3.new(0, 10, 0),
+    "Medium"
+)
+
+MobManager.Remove(SpawnedMobs[1])
+
+ระบบจะนำ Mob ออกจาก ActiveMobs
+และ Destroy Model ออกจาก Workspace
+
+
+================================================================
+11. GET ACTIVE MOBS
+================================================================
+
+ใช้สำหรับดึง Mob ทั้งหมดที่กำลังทำงานอยู่
+
+รูปแบบ:
+
+local Mobs = MobManager.GetActive()
+
+ตัวอย่าง:
+
+local ActiveMobs = MobManager.GetActive()
+
+for _, Mob in ipairs(ActiveMobs) do
+
+    print("Active Mob:", Mob.Name)
+
+end
+
+ระบบจะคืนค่าเป็น Table ของ Model ที่ยังมี Parent อยู่
+
+Mob ที่ถูก Destroy หรือไม่มี Parent
+จะถูกนำออกจาก ActiveMobs เมื่อเรียก GetActive()
+
+
+================================================================
+12. WORKSPACE STORAGE
+================================================================
+
+Mob ที่ถูก Spawn จะถูกเก็บไว้ที่:
+
+Workspace
+└── Mobs
+
+MobManager จะสร้าง Folder นี้ให้อัตโนมัติ
+หากยังไม่มี Folder ชื่อ Mobs
+
+
+================================================================
+13. ERROR / TROUBLESHOOTING
+================================================================
+
+[MobManager] Mob not found:
+    ตรวจสอบชื่อ Model ใน ReplicatedStorage/Mob
+
+[MobManager] Unknown AI:
+    ตรวจสอบ Attribute AILevel
+    และตรวจสอบว่ามี AI ใน AILevels หรือไม่
+
+[MobManager] Missing Humanoid:
+    Model ไม่มี Humanoid
+
+[MobManager] Invalid SpawnCFrame:
+    ตำแหน่ง Spawn ไม่ใช่ Vector3 หรือ CFrame
+
+[MobManager] AI Error:
+    เกิด Error ภายใน AI.Start()
+    ตรวจสอบ Output และ AI Module ที่ใช้งาน
+
+
+================================================================
+14. IMPORTANT NOTES
+================================================================
+
+1. Mob ทุกตัวต้องมี Humanoid
+
+2. Mob ทุกตัวต้องมี HumanoidRootPart
+
+3. AILevel ต้องตรงกับ Key ใน AILevels
+
+4. AI Module ต้องมีฟังก์ชัน Start(Mob, Difficulty)
+
+5. Animation ไม่ใช่ข้อบังคับของ MobManager
+   แต่ AI อาจต้องใช้ Animation ตามระบบของตัวเอง
+
+6. Difficulty จะถูกส่งต่อให้ AI Module
+   MobManager ไม่ได้คำนวณความยากด้วยตัวเอง
+
+7. MobManager เป็นระบบ Server
+   ควรเรียกใช้จาก Script ฝั่ง Server
+
+8. ควรให้ AI Module หยุด Loop และงานที่เกี่ยวข้อง
+   เมื่อ Mob ถูก Destroy เพื่อป้องกันงานค้าง
+
+
+================================================================
+                    END OF DOCUMENTATION
+================================================================
+]]
